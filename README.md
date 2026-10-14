@@ -30,11 +30,7 @@ python install.py --list
 pip install pywebview
 ```
 
-```bash
-claude-switch shortcut
-```
-
-第二条命令会在开始菜单和桌面创建「Claude 切号」快捷方式。账号快照存在 `~/.claude-switch/`，里面有登录凭据，**不在仓库里，也不要放进来**。
+装好后在 Claude 里输入 `/claude-switch` 就会打开「Claude 切号」窗口；后面带参数（如 `/claude-switch use 名字`）则直接执行对应命令。账号快照存在 `~/.claude-switch/`，里面有登录凭据，**不在仓库里，也不要放进来**。
 
 ## 测试
 

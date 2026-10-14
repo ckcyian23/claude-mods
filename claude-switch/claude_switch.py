@@ -13,7 +13,7 @@
   claude_switch.py unlink-sessions                      撤销共享，各账号恢复成独立的真实目录
   claude_switch.py rename <旧名字> <新名字>             给账号快照改名
   claude_switch.py remove <名字>                        删除一个账号快照
-  claude_switch.py shortcut                             创建「Claude 切号」图形窗口的快捷方式
+  claude_switch.py ui                                   打开「Claude 切号」图形窗口
 
 Desktop 相关操作需要先退出 Claude Desktop；如果 Desktop 正在运行，会交给一个
 独立的后台进程执行（退出 → 处理 → 重新启动），所以从 Desktop 会话里调用也没问题。
@@ -740,12 +740,32 @@ def run_desktop_job(job, name, force=False):
             desktop_launch()
 
 
-def spawn_worker(job, name, delay, force=False):
-    """用 WMI 启动一个脱离 Claude Desktop 进程树的后台进程，Desktop 退出时不会被一起结束。"""
+def pythonw():
     exe = Path(sys.executable)
     pyw = exe.with_name("pythonw.exe")
-    exe = pyw if pyw.exists() else exe
-    cmd = f'"{exe}" -I "{Path(__file__).resolve()}" _worker {job} --delay {delay}'
+    return pyw if pyw.exists() else exe
+
+
+def wmi_launch(cmd):
+    """用 WMI 启动进程：父进程是 WmiPrvSE，不在 Claude Desktop 的进程树里，Desktop 退出时不会被一起结束。"""
+    env = dict(os.environ, CCS_CMD=cmd)
+    code, out = powershell(
+        "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        "-Arguments @{CommandLine=$env:CCS_CMD}; $r.ReturnValue", env=env)
+    if out.strip() != "0":
+        die(f"启动后台进程失败：{out}")
+
+
+def open_ui():
+    """打开「Claude 切号」窗口；已经开着就把它叫到最前面（由 claude_switch_ui.py 处理）。"""
+    ui = Path(__file__).resolve().with_name("claude_switch_ui.py")
+    wmi_launch(f'"{pythonw()}" -I "{ui}"')
+    log("已打开「Claude 切号」窗口（已经开着的话会切到最前面）")
+
+
+def spawn_worker(job, name, delay, force=False):
+    """用 WMI 启动一个脱离 Claude Desktop 进程树的后台进程，Desktop 退出时不会被一起结束。"""
+    cmd = f'"{pythonw()}" -I "{Path(__file__).resolve()}" _worker {job} --delay {delay}'
     if name:
         cmd += f' --name "{name}"'
     if force:
@@ -753,12 +773,7 @@ def spawn_worker(job, name, delay, force=False):
     if CANCEL_FILE.exists():
         CANCEL_FILE.unlink()
     set_job("starting", "准备退出 Claude Desktop…")
-    env = dict(os.environ, CCS_CMD=cmd)
-    code, out = powershell(
-        "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
-        "-Arguments @{CommandLine=$env:CCS_CMD}; $r.ReturnValue", env=env)
-    if out.strip() != "0":
-        die(f"启动后台进程失败：{out}")
+    wmi_launch(cmd)
     log(f"Desktop：已交给后台进程处理，约 {delay} 秒后会正常退出 Claude Desktop（不强制），"
         f"换好后自动重新打开。如果 Desktop 问你是否退出，请确认。进度写在 {LOG_FILE}")
 
@@ -875,31 +890,12 @@ def interactive_menu():
     main()
 
 
-def make_shortcut():
-    """在开始菜单和桌面放一个「Claude 切号」快捷方式，打开图形窗口。"""
-    exe = Path(sys.executable)
-    pyw = exe.with_name("pythonw.exe")
-    ui = Path(__file__).resolve().with_name("claude_switch_ui.py")
-    env = dict(os.environ, CCS_TARGET=str(pyw if pyw.exists() else exe),
-               CCS_ARGS=f'-I "{ui}"', CCS_ICON=str(ui.with_name("icon.ico")))
-    ps = (
-        "$s = New-Object -ComObject WScript.Shell; "
-        "foreach ($dir in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) { "
-        "  $l = $s.CreateShortcut((Join-Path $dir 'Claude 切号.lnk')); "
-        "  $l.TargetPath = $env:CCS_TARGET; $l.Arguments = $env:CCS_ARGS; $l.IconLocation = $env:CCS_ICON; "
-        "  $l.Description = 'Claude 账号切换'; $l.Save(); $dir }")
-    code, out = powershell(ps, env=env)
-    if code != 0:
-        die("创建快捷方式失败：" + out)
-    log("已创建「Claude 切号」快捷方式：\n" + out)
-
-
 def main():
     ap = argparse.ArgumentParser(description="Claude 账号快速切换 + Desktop 会话共享")
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("status")
     p.add_argument("--json", action="store_true")
-    sub.add_parser("shortcut")
+    sub.add_parser("ui")
     def desktop_flags(p):
         p.add_argument("--yes", action="store_true", help="确认要退出 Claude Desktop")
         p.add_argument("--force", action="store_true", help="Desktop 退不掉时强制结束（默认绝不强制）")
@@ -934,8 +930,8 @@ def main():
     elif a.cmd == "status":
         st = status_data()
         print(json.dumps(st, ensure_ascii=False)) if a.json else print_status(st)
-    elif a.cmd == "shortcut":
-        make_shortcut()
+    elif a.cmd == "ui":
+        open_ui()
     elif a.cmd == "cancel":
         DATA.mkdir(parents=True, exist_ok=True)
         CANCEL_FILE.write_text("1")

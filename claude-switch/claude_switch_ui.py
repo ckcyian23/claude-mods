@@ -147,6 +147,34 @@ def set_window_icon(window):
         pass
 
 
+TITLE = "Claude 切号"
+_mutex = None
+
+
+def already_running():
+    """已经有一个窗口开着时，把它叫到最前面并返回 True（只允许开一个）。"""
+    global _mutex
+    import ctypes
+    from ctypes import wintypes
+    k32, u32 = ctypes.WinDLL("kernel32", use_last_error=True), ctypes.WinDLL("user32")
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    u32.FindWindowW.restype = wintypes.HWND
+    _mutex = k32.CreateMutexW(None, False, "Local\\ckcyi.claude-switch.ui")
+    if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS
+        return False
+    for _ in range(50):  # 另一个可能刚启动、窗口还没出来，最多等 5 秒
+        hwnd = u32.FindWindowW(None, TITLE)
+        if hwnd:
+            # 先最小化再还原：没有前台权限时 SetForegroundWindow 只会闪任务栏，这样能保证窗口弹到前面
+            if not u32.IsIconic(hwnd):
+                u32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+            u32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            u32.SetForegroundWindow(hwnd)
+            return True
+        time.sleep(0.1)
+    return True
+
+
 def open_window(url):
     """独立窗口（pywebview + 系统自带的 WebView2），窗口关闭时返回。"""
     import webview
@@ -154,7 +182,7 @@ def open_window(url):
     os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp "
         "--webrtc-ip-handling-policy=disable_non_proxied_udp")
-    window = webview.create_window("Claude 切号", url, width=780, height=700, min_size=(600, 520),
+    window = webview.create_window(TITLE, url, width=780, height=700, min_size=(600, 520),
                                    background_color="#F5F4EE")
     window.events.shown += lambda: set_window_icon(window)
     webview.start(private_mode=True)
@@ -168,6 +196,8 @@ def main():
     ap.add_argument("--port", type=int, default=0)
     a = ap.parse_args()
     DEMO = a.demo
+    if not (a.demo or a.no_open) and already_running():
+        return
     try:  # 任务栏上单独成组、显示自己的图标，而不是和 Python 混在一起
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ckcyi.claude-switch")
