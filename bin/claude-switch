@@ -1,0 +1,2 @@
+#!/bin/sh
+exec python -I "$USERPROFILE/.claude/skills/claude-switch/claude_switch.py" "$@"

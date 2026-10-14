@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Claude 切号</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg: #f5f4ee;
+    --card: #ffffff;
+    --ink: #1f1e1d;
+    --muted: #6f6b63;
+    --faint: #a39e94;
+    --line: #e7e3d8;
+    --accent: #d97757;
+    --accent-ink: #ffffff;
+    --accent-soft: #f6e3da;
+    --ok: #4f8a5b;
+    --ok-soft: #e3efe4;
+    --danger: #b9473a;
+    --shadow: 0 1px 2px rgba(31, 30, 29, .04), 0 4px 16px rgba(31, 30, 29, .06);
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1f1e1c;
+      --card: #2a2926;
+      --ink: #f2efe8;
+      --muted: #b0aba1;
+      --faint: #7d786f;
+      --line: #3a3834;
+      --accent: #e08a6b;
+      --accent-ink: #1f1e1c;
+      --accent-soft: #4a3229;
+      --ok: #8cc59a;
+      --ok-soft: #2b3a2e;
+      --danger: #e2796c;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 6px 20px rgba(0, 0, 0, .25);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.5 "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 28px 28px 96px; }
+
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 22px; }
+  .logo {
+    width: 40px; height: 40px; border-radius: 11px; display: grid; place-items: center;
+    background: var(--accent); color: var(--accent-ink);
+  }
+  .logo svg { width: 22px; height: 22px; }
+  h1 {
+    margin: 0; font: 600 21px/1.2 "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    letter-spacing: .2px;
+  }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .spacer { flex: 1; }
+
+  .icon-btn {
+    width: 34px; height: 34px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--card); color: var(--muted); display: grid; place-items: center; cursor: pointer;
+    transition: color .15s, border-color .15s, transform .15s;
+  }
+  .icon-btn:hover { color: var(--ink); border-color: var(--faint); }
+  .icon-btn svg { width: 16px; height: 16px; }
+  .icon-btn.spin svg { animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .now {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 26px;
+  }
+  .now .cell {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
+  }
+  .now .k { font-size: 12px; color: var(--faint); display: flex; align-items: center; gap: 6px; }
+  .now .v { font-weight: 600; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .now .d { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); display: inline-block; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+
+  .section-title {
+    display: flex; align-items: baseline; justify-content: space-between;
+    font-size: 12px; letter-spacing: .6px; color: var(--faint); margin: 0 2px 10px;
+  }
+
+  .list { display: grid; gap: 10px; }
+  .acct {
+    position: relative; display: flex; align-items: center; gap: 14px;
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 14px 14px 14px 16px; box-shadow: var(--shadow);
+    transition: border-color .15s, transform .15s;
+    animation: rise .25s ease both;
+  }
+  .acct:hover { border-color: var(--faint); }
+  .acct.current { border-color: var(--accent); }
+  .acct:has(.menu.open) { z-index: 10; }
+  @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
+  .avatar {
+    width: 42px; height: 42px; border-radius: 50%; flex: none; display: grid; place-items: center;
+    font: 600 17px/1 "Segoe UI Variable Display", "Segoe UI", sans-serif; color: #fff;
+  }
+  .info { flex: 1; min-width: 0; }
+  .name { font-weight: 600; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+  .email { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tags { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+  .tag {
+    font-size: 11.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
+  }
+  .tag.have { color: var(--ink); }
+  .tag.missing { color: var(--faint); border-style: dashed; }
+  .tag.cur { background: var(--accent-soft); border-color: transparent; color: var(--accent); font-weight: 600; }
+  .badge {
+    font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
+    padding: 1px 7px; border-radius: 6px; background: var(--ok-soft); color: var(--ok);
+  }
+
+  .btn {
+    height: 34px; padding: 0 14px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--card); color: var(--ink); font: inherit; font-weight: 600; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px; transition: background .15s, border-color .15s, opacity .15s;
+  }
+  .btn:hover { border-color: var(--faint); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .btn.primary:hover { filter: brightness(1.05); }
+  .btn.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+  .btn.ghost:hover { color: var(--ink); background: var(--line); }
+  .btn.danger { color: var(--danger); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn svg { width: 15px; height: 15px; }
+
+  .menu-wrap { position: relative; }
+  .menu {
+    position: absolute; right: 0; top: 40px; z-index: 5; min-width: 190px; padding: 6px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow);
+    display: none;
+  }
+  .menu.open { display: block; animation: rise .12s ease both; }
+  .menu button {
+    width: 100%; text-align: left; border: 0; background: transparent; color: var(--ink); font: inherit;
+    padding: 8px 10px; border-radius: 8px; cursor: pointer; display: flex; justify-content: space-between; gap: 10px;
+  }
+  .menu button:hover { background: var(--bg); }
+  .menu button small { color: var(--faint); }
+  .menu hr { border: 0; border-top: 1px solid var(--line); margin: 5px 4px; }
+  .menu .danger { color: var(--danger); }
+
+  .empty {
+    text-align: center; padding: 42px 20px; border: 1.5px dashed var(--line); border-radius: var(--radius);
+    color: var(--muted);
+  }
+  .empty b { display: block; color: var(--ink); font-size: 16px; margin-bottom: 6px; }
+
+  .footer {
+    position: fixed; left: 0; right: 0; bottom: 0; padding: 14px 28px;
+    background: linear-gradient(to top, var(--bg) 70%, transparent);
+  }
+  .footer .inner { max-width: 704px; margin: 0 auto; display: flex; gap: 10px; align-items: center; }
+  .footer .hint { color: var(--faint); font-size: 12px; margin-left: auto; }
+
+  /* 弹窗 */
+  .mask {
+    position: fixed; inset: 0; background: rgba(20, 19, 17, .35); display: none; place-items: center; z-index: 20;
+    backdrop-filter: blur(2px);
+  }
+  .mask.open { display: grid; animation: fade .15s ease both; }
+  @keyframes fade { from { opacity: 0; } }
+  .dialog {
+    width: min(440px, calc(100vw - 40px)); background: var(--card); border-radius: 16px; padding: 22px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, .25); animation: rise .18s ease both;
+  }
+  .dialog h3 { margin: 0 0 6px; font-size: 17px; }
+  .dialog p { margin: 0 0 14px; color: var(--muted); white-space: pre-line; }
+  .dialog input[type=text] {
+    width: 100%; height: 38px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg);
+    color: var(--ink); font: inherit; padding: 0 12px; outline: none; user-select: text;
+  }
+  .dialog input[type=text]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .opts { display: grid; gap: 8px; margin-top: 14px; }
+  .opt {
+    display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--line);
+    border-radius: 10px; cursor: pointer;
+  }
+  .opt:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+  .opt input { accent-color: var(--accent); margin-top: 3px; }
+  .opt small { display: block; color: var(--muted); }
+  .dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+
+  /* 进度遮罩与提示 */
+  .busy { text-align: center; }
+  .busy .ring {
+    width: 38px; height: 38px; margin: 6px auto 14px; border-radius: 50%;
+    border: 3px solid var(--accent-soft); border-top-color: var(--accent); animation: spin .9s linear infinite;
+  }
+  .toast {
+    position: fixed; left: 50%; bottom: 76px; transform: translateX(-50%) translateY(10px); opacity: 0;
+    max-width: min(620px, calc(100vw - 40px)); background: var(--ink); color: var(--bg); padding: 10px 14px;
+    border-radius: 12px; font-size: 13px; white-space: pre-line; pointer-events: none;
+    transition: opacity .2s, transform .2s; z-index: 30;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%); }
+  .toast.err { background: var(--danger); color: #fff; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+        <path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"/>
+      </svg>
+    </div>
+    <div>
+      <h1>Claude 切号</h1>
+      <div class="sub">CLI 与 Desktop 账号切换 · 会话列表共享</div>
+    </div>
+    <div class="spacer"></div>
+    <button class="icon-btn" id="refresh" title="刷新">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>
+      </svg>
+    </button>
+  </header>
+
+  <div class="now">
+    <div class="cell"><div class="k">终端 CLI</div><div class="v" id="nowCli">—</div><div class="d" id="nowCliD"></div></div>
+    <div class="cell"><div class="k"><span class="dot" id="dDot"></span>Desktop</div><div class="v" id="nowDesk">—</div><div class="d" id="nowDeskD"></div></div>
+    <div class="cell"><div class="k">会话共享</div><div class="v" id="nowShare">—</div><div class="d" id="nowShareD"></div></div>
+  </div>
+
+  <div class="section-title"><span>已保存的账号</span><span id="count"></span></div>
+  <div class="list" id="list"></div>
+</div>
+
+<div class="footer">
+  <div class="inner">
+    <button class="btn" id="btnSave">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      保存当前登录
+    </button>
+    <button class="btn ghost" id="btnNew">添加新账号…</button>
+    <span class="hint">切换 Desktop 时它会自动重启</span>
+  </div>
+</div>
+
+<div class="mask" id="mask"><div class="dialog" id="dialog"></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+// 本页面用不到 WebRTC，直接移除相关接口，杜绝通过 WebRTC 暴露本机 IP 的可能
+for (const k of ["RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel", "RTCSessionDescription", "RTCIceCandidate"]) {
+  try { Object.defineProperty(window, k, { value: undefined, writable: false, configurable: false }); } catch (e) {}
+}
+try { Object.defineProperty(navigator, "mediaDevices", { value: undefined, configurable: false }); } catch (e) {}
+const TOKEN = "__TOKEN__";
+const $ = (s) => document.querySelector(s);
+let state = null;
+
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: { "Content-Type": "application/json", "X-Token": TOKEN },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return r.json();
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+const PALETTE = ["#d97757", "#5b8def", "#4f8a5b", "#a46fd1", "#c9933a", "#3a9ea5", "#c25f86"];
+function colorFor(name) {
+  let h = 0;
+  for (const ch of name) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return PALETTE[h % PALETTE.length];
+}
+function initial(name) {
+  const t = name.replace(/^[_\-.\s]+/, "");
+  return (t[0] || name[0] || "?").toUpperCase();
+}
+
+function toast(msg, err) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "toast show" + (err ? " err" : "");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => (t.className = "toast" + (err ? " err" : "")), err ? 6000 : 3500);
+}
+
+async function refresh() {
+  $("#refresh").classList.add("spin");
+  try {
+    state = await api("/api/status");
+    render();
+  } catch (e) {
+    toast("读取状态失败：" + e, true);
+  } finally {
+    setTimeout(() => $("#refresh").classList.remove("spin"), 300);
+  }
+}
+
+function render() {
+  const { cli, desktop, accounts, sessions } = state;
+  $("#nowCli").textContent = cli.current || (cli.loggedIn ? "还没保存" : "未登录");
+  $("#nowCliD").textContent = cli.email || "";
+  $("#nowDesk").textContent = desktop.current || (desktop.loggedIn ? "还没保存" : "未登录");
+  $("#nowDeskD").textContent = (desktop.email ? desktop.email + " · " : "") + (desktop.running ? "运行中" : "未运行");
+  $("#dDot").className = "dot" + (desktop.running ? " on" : "");
+  $("#nowShare").textContent = sessions.total && sessions.linked === sessions.total ? "已开启" : (sessions.linked ? "部分开启" : "未开启");
+  $("#nowShareD").textContent = `${sessions.linked}/${sessions.total} 个账号 · ${sessions.shared} 个会话`;
+  $("#count").textContent = accounts.length ? accounts.length + " 个" : "";
+
+  const list = $("#list");
+  if (!accounts.length) {
+    list.innerHTML = `<div class="empty"><b>还没有保存任何账号</b>先点下方「保存当前登录」，把现在登录的账号存下来。</div>`;
+    return;
+  }
+  list.innerHTML = accounts.map((a, i) => {
+    const isCli = a.name === cli.current, isDesk = a.name === desktop.current;
+    const both = isCli && isDesk;
+    const tags = [
+      a.hasCli ? `<span class="tag ${isCli ? "cur" : "have"}">${isCli ? "● " : ""}CLI</span>` : `<span class="tag missing">CLI 未保存</span>`,
+      a.hasDesktop ? `<span class="tag ${isDesk ? "cur" : "have"}">${isDesk ? "● " : ""}Desktop</span>` : `<span class="tag missing">Desktop 未保存</span>`,
+    ].join("");
+    return `
+      <div class="acct ${isCli || isDesk ? "current" : ""}" style="animation-delay:${i * 30}ms">
+        <div class="avatar" style="background:${colorFor(a.name)}">${esc(initial(a.name))}</div>
+        <div class="info">
+          <div class="name">${esc(a.name)} ${a.plan ? `<span class="badge">${esc(a.plan)}</span>` : ""}</div>
+          <div class="email">${esc(a.email || "邮箱未知")}</div>
+          <div class="tags">${tags}</div>
+        </div>
+        <button class="btn ${both ? "" : "primary"}" ${both ? "disabled" : ""} data-act="use" data-name="${esc(a.name)}">
+          ${both ? "使用中" : "切换"}
+        </button>
+        <div class="menu-wrap">
+          <button class="icon-btn" data-act="menu" title="更多">
+            <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
+          </button>
+          <div class="menu">
+            <button data-act="use-cli" data-name="${esc(a.name)}" ${a.hasCli && !isCli ? "" : "disabled"}>只切 CLI <small>不重启</small></button>
+            <button data-act="use-desktop" data-name="${esc(a.name)}" ${a.hasDesktop && !isDesk ? "" : "disabled"}>只切 Desktop <small>会重启</small></button>
+            <hr>
+            <button data-act="rename" data-name="${esc(a.name)}">改名</button>
+            <button class="danger" data-act="remove" data-name="${esc(a.name)}">删除快照</button>
+          </div>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+/* ---------- 弹窗 ---------- */
+function dialog(html) {
+  $("#dialog").innerHTML = html;
+  $("#mask").classList.add("open");
+  return new Promise((resolve) => {
+    $("#dialog").onclick = (e) => {
+      const b = e.target.closest("[data-r]");
+      if (!b) return;
+      const r = b.dataset.r;
+      if (r === "cancel") return close(resolve, null);
+      const input = $("#dialog input[type=text]");
+      const opt = $("#dialog input[type=radio]:checked");
+      close(resolve, { input: input ? input.value.trim() : null, opt: opt ? opt.value : null });
+    };
+    const input = $("#dialog input[type=text]");
+    if (input) {
+      input.focus();
+      input.select();
+      input.onkeydown = (e) => { if (e.key === "Enter") $("#dialog [data-r=ok]").click(); };
+    }
+  });
+}
+function close(resolve, v) { $("#mask").classList.remove("open"); resolve(v); }
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("#mask").classList.contains("open")) $("#dialog [data-r=cancel]")?.click(); });
+
+const confirmDlg = (title, text, okText = "继续", danger = false) => dialog(`
+  <h3>${title}</h3><p>${text}</p>
+  <div class="row"><button class="btn ghost" data-r="cancel">取消</button>
+  <button class="btn ${danger ? "danger" : "primary"}" data-r="ok">${okText}</button></div>`);
+
+function busy(text, cancellable = false) {
+  $("#dialog").innerHTML = `<div class="busy"><div class="ring"></div><h3>${text}</h3><p id="busySub">请稍候…</p>
+    ${cancellable ? `<div class="row" style="justify-content:center"><button class="btn ghost" id="busyCancel">取消</button></div>` : ""}</div>`;
+  $("#dialog").onclick = null;
+  $("#mask").classList.add("open");
+  const c = $("#busyCancel");
+  if (c) c.onclick = async () => { c.disabled = true; c.textContent = "正在取消…"; await api("/api/run", { args: ["cancel"] }); };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function run(args, { desktop = false, label = "处理中" } = {}) {
+  busy(label, desktop && state.desktop.running);
+  const startedAt = Date.now() / 1000 - 2;
+  const res = await api("/api/run", { args: desktop ? [...args, "--yes"] : args });
+  if (res.code !== 0) {
+    $("#mask").classList.remove("open");
+    toast(res.out || "失败", true);
+    await refresh();
+    return;
+  }
+  if (desktop && state.desktop.running) {
+    // 后台进程在做：正常退出 Desktop →（必要时等你确认退出）→ 切换 → 重新打开
+    let job = null;
+    for (let i = 0; i < 260; i++) {
+      await sleep(1000);
+      await refresh();
+      job = state.job;
+      if (job && job.at >= startedAt) {
+        $("#busySub").textContent = job.message || "";
+        if (["done", "failed", "cancelled"].includes(job.state)) break;
+      }
+    }
+    $("#mask").classList.remove("open");
+    if (!job || !["done", "failed", "cancelled"].includes(job.state)) return toast("还在处理中，稍后点右上角刷新看看", true);
+    return toast(job.message, job.state !== "done");
+  }
+  await refresh();
+  $("#mask").classList.remove("open");
+  toast(res.out.split("\n").filter((l) => l && !l.startsWith("Desktop：已交给")).slice(-3).join("\n") || "完成");
+}
+
+/* ---------- 操作 ---------- */
+// 会退出 Desktop 的操作，先把打开的会话列出来提醒，确认后才执行
+async function confirmDesktop(title, what, okText) {
+  const d = state.desktop;
+  if (!d.running) return true;
+  const act = d.activity || { open: 0, recent: [] };
+  const lines = [what, "", "需要先退出 Claude Desktop。只会正常退出、不会强制结束；如果 Desktop 问你是否退出，请确认。换好后会自动重新打开。"];
+  if (act.open) lines.push("", `Desktop 现在有 ${act.open} 个打开的会话，进行中的对话会被打断（重启后从侧边栏点回去即可）。`);
+  if (act.recent.length) lines.push("最近 10 分钟用过：" + act.recent.slice(0, 5).map((t) => "「" + t + "」").join(" "));
+  return !!(await confirmDlg(title, esc(lines.join("\n")), okText));
+}
+
+async function doUse(name, only) {
+  const a = state.accounts.find((x) => x.name === name);
+  const willDesk = only !== "cli" && a.hasDesktop && name !== state.desktop.current;
+  const what = only === "cli" ? "只切换 CLI。" : only === "desktop" ? "只切换 Desktop。" : "切换 CLI 和 Desktop。";
+  if (willDesk && !(await confirmDesktop(`切换到 ${esc(name)}`, what, "切换"))) return;
+  await run(["use", name, ...(only ? ["--only", only] : [])], { desktop: willDesk, label: `正在切换到 ${esc(name)}` });
+}
+
+async function doSave() {
+  const { cli, desktop } = state;
+  const lc = (s) => (s || "").toLowerCase();
+  // 两边邮箱一致才能一起保存；邮箱读不到时交给脚本按账号 ID 再核对一次
+  const same = !cli.loggedIn || !desktop.loggedIn || !desktop.email || lc(cli.email) === lc(desktop.email);
+  const r = await dialog(`
+    <h3>保存当前登录</h3>
+    <p>给现在登录的账号起个名字，以后用这个名字切换。</p>
+    <input type="text" placeholder="例如 __ckcyi" value="${esc(cli.current || desktop.current || "")}">
+    <div class="opts">
+      <label class="opt"><input type="radio" name="s" value="both" ${same ? "checked" : "disabled"}>
+        <div>CLI 和 Desktop 都保存<small>${same ? "两边必须是同一个账号" : "两边现在登录的不是同一个账号，不能一起保存"}</small></div></label>
+      <label class="opt"><input type="radio" name="s" value="cli" ${same ? "" : "checked"} ${cli.loggedIn ? "" : "disabled"}>
+        <div>只保存 CLI<small>${esc(cli.loggedIn ? cli.email : "CLI 未登录")}</small></div></label>
+      <label class="opt"><input type="radio" name="s" value="desktop" ${desktop.loggedIn ? "" : "disabled"}>
+        <div>只保存 Desktop<small>${esc(desktop.loggedIn ? (desktop.email || "邮箱未知") : "Desktop 未登录")} · 会重启一次</small></div></label>
+    </div>
+    <div class="row"><button class="btn ghost" data-r="cancel">取消</button><button class="btn primary" data-r="ok">保存</button></div>`);
+  if (!r || !r.input) return;
+  const scope = r.opt || "both";
+  if (scope !== "cli" && desktop.loggedIn && !(await confirmDesktop(`保存 ${esc(r.input)}`, "保存 Desktop 登录。", "保存"))) return;
+  await run(["save", r.input, ...(scope === "both" ? [] : ["--only", scope])],
+    { desktop: scope !== "cli" && desktop.loggedIn, label: `正在保存 ${esc(r.input)}` });
+}
+
+async function doNew() {
+  const r = await dialog(`
+    <h3>添加新账号</h3>
+    <p>会先把当前账号存回它自己的快照，再清掉登录状态（不会让原账号失效），然后你登录新账号。</p>
+    <div class="opts">
+      <label class="opt"><input type="radio" name="s" value="both" checked>
+        <div>CLI 和 Desktop 都登录新账号<small>Desktop 会重启到登录页</small></div></label>
+      <label class="opt"><input type="radio" name="s" value="cli">
+        <div>只给 CLI 登录新账号<small>不重启 Desktop</small></div></label>
+      <label class="opt"><input type="radio" name="s" value="desktop">
+        <div>只给 Desktop 登录新账号<small>Desktop 会重启到登录页</small></div></label>
+    </div>
+    <p style="margin-top:14px">之后：Desktop 在登录页登录；CLI 在终端运行 <b>claude</b> 并输入 <b>/login</b>。都登录好后回来点「保存当前登录」。</p>
+    <div class="row"><button class="btn ghost" data-r="cancel">取消</button><button class="btn primary" data-r="ok">开始</button></div>`);
+  if (!r) return;
+  if (r.opt !== "cli" && !(await confirmDesktop("添加新账号", "清掉 Desktop 的登录状态，重启到登录页。", "开始"))) return;
+  await run(["login-new", ...(r.opt === "both" ? [] : ["--only", r.opt])],
+    { desktop: r.opt !== "cli", label: "正在清除登录状态" });
+}
+
+async function doRename(name) {
+  const r = await dialog(`
+    <h3>改名</h3><p>只改名字，不影响登录状态。</p>
+    <input type="text" value="${esc(name)}">
+    <div class="row"><button class="btn ghost" data-r="cancel">取消</button><button class="btn primary" data-r="ok">改名</button></div>`);
+  if (r && r.input && r.input !== name) await run(["rename", name, r.input], { label: "正在改名" });
+}
+
+async function doRemove(name) {
+  const ok = await confirmDlg(`删除 ${esc(name)}？`, "只删除本地保存的登录快照，不影响账号本身。删除后想再用，需要重新登录并保存。", "删除", true);
+  if (ok) await run(["remove", name], { label: "正在删除" });
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-act]");
+  document.querySelectorAll(".menu.open").forEach((m) => { if (!b || b.dataset.act !== "menu" || m !== b.nextElementSibling) m.classList.remove("open"); });
+  if (!b || b.disabled) return;
+  const n = b.dataset.name;
+  switch (b.dataset.act) {
+    case "menu": b.nextElementSibling.classList.toggle("open"); break;
+    case "use": doUse(n); break;
+    case "use-cli": doUse(n, "cli"); break;
+    case "use-desktop": doUse(n, "desktop"); break;
+    case "rename": doRename(n); break;
+    case "remove": doRemove(n); break;
+  }
+});
+$("#refresh").onclick = refresh;
+$("#btnSave").onclick = doSave;
+$("#btnNew").onclick = doNew;
+
+setInterval(() => api("/api/ping", {}).catch(() => {}), 3000);
+window.addEventListener("pagehide", () => navigator.sendBeacon("/api/bye?t=" + TOKEN));
+window.addEventListener("focus", refresh);
+refresh();
+</script>
+</body>
+</html>
