@@ -22,7 +22,7 @@ python install.py --list
 
 | Skill | 作用 | 依赖 |
 | --- | --- | --- |
-| [claude-switch](claude-switch/SKILL.md) | 一键切换 Claude 账号（CLI 和 Desktop 都切），所有账号共用同一份 Desktop 会话列表。带图形窗口「Claude 切号」。 | Python 3.12+；图形窗口需要 `pip install pywebview`（Windows 11 自带 WebView2） |
+| [claude-switch](claude-switch/SKILL.md) | 一键切换 Claude 账号（CLI 和 Desktop 都切），切号时自动合并各账号的 Desktop 会话列表。带图形窗口「Claude 切号」。 | Python 3.12+；图形窗口需要 `pip install pywebview`（Windows 11 自带 WebView2） |
 
 ### claude-switch 首次使用
 

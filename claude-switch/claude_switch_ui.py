@@ -45,7 +45,7 @@ DEMO_STATUS = {
         {"name": "work", "hasCli": False, "hasDesktop": True, "email": "work@example.com",
          "cliEmail": None, "desktopEmail": "work@example.com", "plan": None},
     ],
-    "sessions": {"linked": 2, "total": 2, "shared": 14},
+    "sessions": {"accounts": 2, "count": 14, "inSync": True, "links": 0},
 }
 
 

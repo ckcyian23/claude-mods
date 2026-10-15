@@ -1,12 +1,12 @@
 ---
 name: claude-switch
-description: 快速切换 Claude 账号（Claude Code CLI 和 Claude Desktop 都切），并让所有账号共用同一份 Desktop 会话列表（目录链接，不占额外空间）。用于"切换账号"、"切到 xx 号"、"换个 Claude 账号"、"保存当前账号"、"添加新账号"、"同步会话"、"看看现在是哪个账号"等。
+description: 快速切换 Claude 账号（Claude Code CLI 和 Claude Desktop 都切），并让所有账号的 Desktop 会话列表保持一致（切号时自动合并）。用于"切换账号"、"切到 xx 号"、"换个 Claude 账号"、"保存当前账号"、"添加新账号"、"同步会话"、"看看现在是哪个账号"等。
 argument-hint: "[use|save <名字>] [login-new] [status] [rename <旧> <新>] [remove <名字>] [cancel]  可加 --only cli|desktop"
 ---
 
 # Claude 账号切换（claude-switch）
 
-入口脚本是本文件所在目录下的 `claude_switch.py`（下文写作 `<技能目录>/claude_switch.py`），只用 Python 标准库。账号快照、共享会话、备份、日志都在 `~/.claude-switch/`。
+入口脚本是本文件所在目录下的 `claude_switch.py`（下文写作 `<技能目录>/claude_switch.py`），只用 Python 标准库。账号快照、会话合并副本、备份、日志都在 `~/.claude-switch/`。
 
 运行方式（Bash）：
 
@@ -30,11 +30,11 @@ python -I "<技能目录>/claude_switch.py" <命令>
 | 命令 | 作用 |
 | --- | --- |
 | `ui` | 打开「Claude 切号」图形窗口（已经开着就切到最前面，只会有一个窗口） |
-| `status [--json]` | 显示 CLI / Desktop 当前账号、已保存的账号、会话共享状态 |
+| `status [--json]` | 显示 CLI / Desktop 当前账号、已保存的账号、会话同步状态 |
 | `use <名字> [--only cli\|desktop]` | 切换到某个账号（默认 CLI 和 Desktop 一起切，缺哪部分快照就跳过哪部分） |
 | `save <名字> [--only cli\|desktop]` | 把当前登录的账号存成快照 |
 | `login-new [--only cli\|desktop]` | 先保存当前账号，再清掉登录态，准备登录一个新账号 |
-| `link-sessions` / `unlink-sessions` | 开启 / 撤销 Desktop 会话共享（`use`、`save` 会自动开启） |
+| `sync-sessions` | 手动合并所有账号的 Desktop 会话列表（`use`、`save`、`login-new` 会自动做） |
 | `cancel` | 取消正在等 Desktop 退出的切换（此时什么都还没改） |
 | `rename <旧名字> <新名字>` | 给账号快照改名（只改名字，不影响登录态） |
 | `remove <名字>` | 删除一个账号快照 |
@@ -45,7 +45,7 @@ python -I "<技能目录>/claude_switch.py" <命令>
 
 ## 使用时注意
 
-- **凡是涉及 Desktop 的操作都要先退出 Claude Desktop**（`use`、`save`、`login-new`、`link-sessions`、`unlink-sessions`）。Desktop 正在运行时，这些命令**不带 `--yes` 会先停下**（退出码 3），并打印打开的会话数和最近 10 分钟用过的会话标题，此时什么都没改。你要：
+- **凡是涉及 Desktop 的操作都要先退出 Claude Desktop**（`use`、`save`、`login-new`、`sync-sessions`）。Desktop 正在运行时，这些命令**不带 `--yes` 会先停下**（退出码 3），并打印打开的会话数和最近 10 分钟用过的会话标题，此时什么都没改。你要：
   1. 把这段提醒原样转告用户（会话标题都列出来），并说明：如果是在 Desktop 里的对话调用的，这个对话也会被打断，重启后从侧边栏点回来即可。
   2. 用户明确同意后，才加 `--yes` 重新运行。不要自己替用户加 `--yes`。
 - 退出 Desktop 只用正常关闭，**绝不强制结束**。Desktop 弹出"是否退出"时由用户决定；如果它缩到了托盘，会等用户右键托盘图标退出，最多等 3 分钟，等不到或用户运行了 `cancel` 就放弃，什么都不改。`--force`（退不掉时强制结束）只有用户明确要求时才能用。
@@ -65,6 +65,7 @@ python -I "<技能目录>/claude_switch.py" <命令>
 - CLI：替换 `~/.claude/.credentials.json` 里的 `claudeAiOauth`，以及 `~/.claude.json` 里的 `oauthAccount`。其它设置不动。
 - Desktop：先退出 App，再替换 Cookies、Local Storage、IndexedDB 等登录相关文件，以及 `config.json` 里 `oauth:*` 和 `lastKnownAccountUuid` 这几项，然后重启。MCP 配置（`claude_desktop_config.json`）所有账号共用，不切换。
 - 切走之前，会先把当前账号最新的登录态写回它自己的快照（token 会轮换，不这样做旧快照会失效）。
-- 会话共享：`claude-code-sessions/<账号>/<组织>` 都做成 junction，指向 `~/.claude-switch/shared/claude-code-sessions`。对话记录本身在 `~/.claude/projects`，本来就是共用的。
+- 会话同步：Desktop 的会话列表在 `claude-code-sessions/<账号>/<组织>/local_*.json`。每次 Desktop 退出后（切号、保存、`sync-sessions`），把所有账号目录合并：同名文件取修改时间最新的，有 `deleted_<id>` 标记的会话在所有账号里都删掉，合并副本另存在 `~/.claude-switch/shared/claude-code-sessions`。对话记录本身在 `~/.claude/projects`，本来就是共用的。
+- **会话目录绝不能做成链接（junction / symlink）**：Desktop 发现是链接会拒绝写入（日志里是 `Refusing non-directory at private dir path (symlink/file plant)`），会话的新建、改名、续写位置都存不下来，重启后会话丢失或内容回退。旧版本留下的链接，`sync-sessions` 会自动换回真实目录。
 - Desktop 的操作由 WMI 启动的独立进程完成，不在 Desktop 的进程树里，所以 Desktop 退出时它不会被一起结束。
-- 每次切换前都会备份当前登录态到 `~/.claude-switch/backups/`（保留最近 5 份）；第一次开启共享前，原会话目录备份在 `backups/sessions-before-link/`。
+- 每次切换前都会备份当前登录态到 `~/.claude-switch/backups/`（保留最近 5 份）；每次合并会话前，各账号的会话目录备份在 `backups/sessions-<时间>/`（同样保留最近 5 份）。

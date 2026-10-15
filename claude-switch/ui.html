@@ -217,7 +217,7 @@
     </div>
     <div>
       <h1>Claude 切号</h1>
-      <div class="sub">CLI 与 Desktop 账号切换 · 会话列表共享</div>
+      <div class="sub">CLI 与 Desktop 账号切换 · 会话列表同步</div>
     </div>
     <div class="spacer"></div>
     <button class="icon-btn" id="refresh" title="刷新">
@@ -230,7 +230,7 @@
   <div class="now">
     <div class="cell"><div class="k">终端 CLI</div><div class="v" id="nowCli">—</div><div class="d" id="nowCliD"></div></div>
     <div class="cell"><div class="k"><span class="dot" id="dDot"></span>Desktop</div><div class="v" id="nowDesk">—</div><div class="d" id="nowDeskD"></div></div>
-    <div class="cell"><div class="k">会话共享</div><div class="v" id="nowShare">—</div><div class="d" id="nowShareD"></div></div>
+    <div class="cell"><div class="k">会话同步</div><div class="v" id="nowShare">—</div><div class="d" id="nowShareD"></div></div>
   </div>
 
   <div class="section-title"><span>已保存的账号</span><span id="count"></span></div>
@@ -312,8 +312,8 @@ function render() {
   $("#nowDesk").textContent = desktop.current || (desktop.loggedIn ? "还没保存" : "未登录");
   $("#nowDeskD").textContent = (desktop.email ? desktop.email + " · " : "") + (desktop.running ? "运行中" : "未运行");
   $("#dDot").className = "dot" + (desktop.running ? " on" : "");
-  $("#nowShare").textContent = sessions.total && sessions.linked === sessions.total ? "已开启" : (sessions.linked ? "部分开启" : "未开启");
-  $("#nowShareD").textContent = `${sessions.linked}/${sessions.total} 个账号 · ${sessions.shared} 个会话`;
+  $("#nowShare").textContent = sessions.links ? "需要修复" : (sessions.inSync ? "各账号一致" : "切号时合并");
+  $("#nowShareD").textContent = `${sessions.accounts} 个账号 · ${sessions.count} 个会话`;
   $("#count").textContent = accounts.length ? accounts.length + " 个" : "";
 
   const list = $("#list");

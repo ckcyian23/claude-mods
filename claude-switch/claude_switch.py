@@ -1,6 +1,6 @@
-"""claude-switch: Claude 账号快速切换（CLI + Desktop）与 Desktop 会话共享。
+"""claude-switch: Claude 账号快速切换（CLI + Desktop）与 Desktop 会话同步。
 
-只用标准库。账号快照、共享会话、备份、日志都放在 ~/.claude-switch/ 下。
+只用标准库。账号快照、会话合并副本、备份、日志都放在 ~/.claude-switch/ 下。
 任何输出都不打印 token / cookie 内容。
 
 用法:
@@ -9,8 +9,7 @@
   claude_switch.py save <名字> [--only cli|desktop]      把当前登录的账号存成快照
   claude_switch.py use <名字>  [--only cli|desktop]      切换到某个账号
   claude_switch.py login-new   [--only cli|desktop]      清掉当前登录态，准备登录一个新账号
-  claude_switch.py link-sessions                        让所有账号共用同一份 Desktop 会话列表
-  claude_switch.py unlink-sessions                      撤销共享，各账号恢复成独立的真实目录
+  claude_switch.py sync-sessions                        合并所有账号的 Desktop 会话列表（切号时会自动做）
   claude_switch.py rename <旧名字> <新名字>             给账号快照改名
   claude_switch.py remove <名字>                        删除一个账号快照
   claude_switch.py ui                                   打开「Claude 切号」图形窗口
@@ -39,7 +38,7 @@ except Exception:
 HOME = Path.home()
 DATA = HOME / ".claude-switch"
 ACCOUNTS = DATA / "accounts"
-SHARED_SESSIONS = DATA / "shared" / "claude-code-sessions"
+SHARED_SESSIONS = DATA / "shared" / "claude-code-sessions"  # 所有账号会话条目的合并副本
 BACKUPS = DATA / "backups"
 LOG_FILE = DATA / "logs" / "claude-switch.log"
 LOCK_FILE = DATA / "switch.lock"
@@ -166,13 +165,6 @@ NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW：从图形窗口调用时不弹出�
 
 def run_hidden(args, **kw):
     return subprocess.run(args, capture_output=True, creationflags=NO_WINDOW, **kw)
-
-
-def make_junction(link, target):
-    r = run_hidden(["cmd", "/c", "mklink", "/J", str(link), str(target)])
-    if r.returncode != 0:
-        die(f"创建目录链接失败：{link} -> {target}："
-            + r.stderr.decode("gbk", "replace").strip())
 
 
 def powershell(cmd, env=None):
@@ -597,7 +589,7 @@ def desktop_backup_live(tag):
 def prune_backups():
     if not BACKUPS.exists():
         return
-    for prefix in ("desktop-", "cli-"):
+    for prefix in ("desktop-", "cli-", "sessions-"):
         olds = sorted(p for p in BACKUPS.iterdir() if p.name.startswith(prefix))
         for p in olds[:-KEEP_BACKUPS]:
             remove_path(p)
@@ -653,7 +645,7 @@ def desktop_clear():
         "Desktop 启动后登录新账号，然后 save <名字> --only desktop。")
 
 
-# ---------------------------------------------------------------- 会话共享
+# ---------------------------------------------------------------- 会话同步
 
 def sessions_root():
     return desktop_dir() / "claude-code-sessions"
@@ -672,50 +664,64 @@ def org_dirs():
     return res
 
 
-def merge_into(src_dir, dst_dir):
-    n = 0
-    for f in src_dir.iterdir():
-        t = dst_dir / f.name
-        if t.exists():
-            if f.stat().st_mtime <= t.stat().st_mtime:
-                continue
-            remove_path(t)
-        copy_path(f, t)
-        n += 1
-    return n
+def sessions_backup(orgs):
+    bk = BACKUPS / f"sessions-{now_stamp()}"
+    for org in orgs:
+        if org.exists():
+            shutil.copytree(org, bk / org.parent.name / org.name, dirs_exist_ok=True)
+    prune_backups()
 
 
-def link_sessions(quiet=False):
+def sync_sessions(quiet=False):
+    """把所有账号的 Desktop 会话条目合并成同一份，写回每个账号目录（Desktop 必须已退出）。
+
+    不能用目录链接：Desktop 发现会话目录是链接（junction/symlink）时会拒绝写入，
+    会话的任何改动都存不下来。所以改成在切号时复制合并：同名文件取修改时间最新的，
+    有 deleted_<id> 标记的会话在所有账号里都删掉。合并前先备份。
+    """
+    orgs = org_dirs()
     SHARED_SESSIONS.mkdir(parents=True, exist_ok=True)
-    shared_real = os.path.realpath(SHARED_SESSIONS)
-    linked = merged = 0
-    for org in org_dirs():
-        if is_junction(org):
-            if os.path.realpath(org) == shared_real:
-                continue
-            os.rmdir(org)
-        else:
-            bk = BACKUPS / "sessions-before-link" / org.parent.name / org.name
-            if not bk.exists():
-                bk.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(org, bk)
-            merged += merge_into(org, SHARED_SESSIONS)
-            remove_path(org)
-        make_junction(org, SHARED_SESSIONS)
-        linked += 1
-    total = len([p for p in SHARED_SESSIONS.iterdir() if p.name.startswith("local_")])
-    if linked or not quiet:
-        log(f"会话共享：新链接 {linked} 个账号目录，合并 {merged} 个文件，共享列表现有 {total} 个会话")
-
-
-def unlink_sessions():
-    n = 0
-    for org in org_dirs():
+    fixed = 0
+    for org in orgs:  # 早期版本留下的链接：换回真实目录
         if is_junction(org):
             os.rmdir(org)
             shutil.copytree(SHARED_SESSIONS, org)
-            n += 1
-    log(f"会话共享：已撤销 {n} 个链接，各账号恢复为独立目录（内容为当前共享列表的副本）")
+            fixed += 1
+    sessions_backup(orgs)
+    newest = {}  # 文件名 -> 最新版本所在路径
+    for d in orgs + [SHARED_SESSIONS]:
+        for f in d.iterdir():
+            if f.is_file() and (f.name not in newest or f.stat().st_mtime > newest[f.name].stat().st_mtime):
+                newest[f.name] = f
+    deleted = {n[len("deleted_"):] for n in newest if n.startswith("deleted_")}
+    gone = {f"local_{i}.json" for i in deleted}
+    copied = removed = 0
+    for d in orgs + [SHARED_SESSIONS]:
+        for name, src in newest.items():
+            t = d / name
+            if name in gone:
+                if t.exists():
+                    remove_path(t)
+                    removed += 1
+                continue
+            if src.parent == d or (t.exists() and t.stat().st_mtime >= src.stat().st_mtime):
+                continue
+            copy_path(src, t)
+            copied += 1
+    total = len([n for n in newest if n.startswith("local_") and n not in gone])
+    if fixed:
+        log(f"会话同步：已把 {fixed} 个目录链接换回真实目录（Desktop 不允许会话目录是链接）")
+    if copied or removed or not quiet:
+        log(f"会话同步：{len(orgs)} 个账号目录已合并，共 {total} 个会话（复制 {copied} 个文件，删除 {removed} 个）")
+
+
+def sessions_status():
+    orgs = [o for o in org_dirs() if o.is_dir() and not is_junction(o)]
+    names = [{f.name: int(f.stat().st_mtime) for f in o.iterdir() if f.name.startswith("local_")} for o in orgs]
+    allnames = set().union(*names) if names else set()
+    return {"accounts": len(orgs), "count": len(allnames),
+            "inSync": all(n == names[0] for n in names),
+            "links": sum(1 for o in org_dirs() if is_junction(o))}
 
 
 # ---------------------------------------------------------------- 调度
@@ -731,10 +737,8 @@ def run_desktop_job(job, name, force=False):
             desktop_use(name)
         elif job == "login-new":
             desktop_clear()
-        if job in ("save", "use", "link-sessions"):
-            link_sessions(quiet=True)
-        elif job == "unlink-sessions":
-            unlink_sessions()
+        if job in ("save", "use", "login-new", "sync-sessions"):
+            sync_sessions(quiet=job != "sync-sessions")
     finally:
         if was_running or job in ("use", "login-new"):
             desktop_launch()
@@ -805,9 +809,6 @@ def status_data():
     _, cli_acc = cli_live()
     cli_acc = cli_acc or {}
     d_uuid = desktop_live_uuid()
-    orgs = org_dirs()
-    shared_real = os.path.realpath(SHARED_SESSIONS) if SHARED_SESSIONS.exists() else None
-    linked = sum(1 for o in orgs if is_junction(o) and os.path.realpath(o) == shared_real)
     accounts = []
     for m in all_accounts():
         c, d = m.get("cli") or {}, m.get("desktop") or {}
@@ -829,9 +830,7 @@ def status_data():
                     "activity": desktop_activity() if running else {"open": 0, "recent": []}},
         "job": read_json(JOB_FILE, None),
         "accounts": accounts,
-        "sessions": {"linked": linked, "total": len(orgs),
-                     "shared": len([p for p in SHARED_SESSIONS.iterdir() if p.name.startswith("local_")])
-                     if SHARED_SESSIONS.exists() else 0},
+        "sessions": sessions_status(),
     }
 
 
@@ -855,8 +854,13 @@ def print_status(st):
               f"{'  ' + a['plan'] if a['plan'] else ''}  [已保存：{'、'.join(parts)}]"
               f"{'  ← ' + '、'.join(mark) if mark else ''}")
     s = st["sessions"]
-    print(f"会话共享：{s['linked']}/{s['total']} 个账号目录已共享，共享列表里有 {s['shared']} 个会话"
-          + ("" if s["linked"] == s["total"] else "（运行 link-sessions 补上）"))
+    if s["links"]:
+        state = "还有旧版的目录链接，Desktop 存不了会话，请运行 sync-sessions 修复"
+    elif s["inSync"]:
+        state = "各账号一致"
+    else:
+        state = "当前账号有新改动，下次切号时自动合并"
+    print(f"会话同步：{s['accounts']} 个账号目录，共 {s['count']} 个会话，{state}")
 
 
 def interactive_menu():
@@ -891,7 +895,7 @@ def interactive_menu():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Claude 账号快速切换 + Desktop 会话共享")
+    ap = argparse.ArgumentParser(description="Claude 账号快速切换 + Desktop 会话同步")
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("status")
     p.add_argument("--json", action="store_true")
@@ -907,8 +911,7 @@ def main():
     p = sub.add_parser("login-new")
     p.add_argument("--only", choices=["cli", "desktop"])
     desktop_flags(p)
-    desktop_flags(sub.add_parser("link-sessions"))
-    desktop_flags(sub.add_parser("unlink-sessions"))
+    desktop_flags(sub.add_parser("sync-sessions"))
     sub.add_parser("cancel")
     p = sub.add_parser("rename")
     p.add_argument("old")
@@ -969,7 +972,7 @@ def main():
             import traceback
             log("后台进程异常：\n" + traceback.format_exc())
             raise
-    elif a.cmd in ("link-sessions", "unlink-sessions"):
+    elif a.cmd == "sync-sessions":
         confirm_desktop_or_exit(a.yes)
         desktop_dispatch(a.cmd, None, force=a.force)
     else:
