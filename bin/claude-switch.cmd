@@ -1,2 +1,2 @@
 @echo off
-python -I "%USERPROFILE%\.claude\skills\claude-switch\claude_switch.py" %*
+python -I "__SCRIPT__" %*

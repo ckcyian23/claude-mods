@@ -1,0 +1,5 @@
+{
+  "name": "ckcyi-mods",
+  "owner": { "name": "ckcyi" },
+  "plugins": [{ "name": "account-switch", "source": "./mods/account-switch" }]
+}

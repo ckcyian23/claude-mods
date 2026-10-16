@@ -1,6 +1,6 @@
 """沙盒测试：用假的 HOME、假的 Desktop 目录和假 token 跑完整流程，不碰真实登录态，也不会关掉真实的 Desktop。
 
-  python -I tests/claude-switch/test_quit.py
+  python -I mods/account-switch/tests/test_quit.py
 """
 import os, tempfile, sys, time, threading, importlib.util
 from pathlib import Path
@@ -9,10 +9,12 @@ root = Path(tempfile.gettempdir()) / "claude-switch-test" / "quit-sandbox"
 import shutil; shutil.rmtree(root, ignore_errors=True)
 os.environ.update(USERPROFILE=str(root), HOME=str(root), APPDATA=str(root / "appdata"))
 (root / "appdata" / "Claude").mkdir(parents=True)
-spec = importlib.util.spec_from_file_location("cs", str(Path(__file__).resolve().parents[2] / "claude-switch" / "claude_switch.py")); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+spec = importlib.util.spec_from_file_location("cs", str(Path(__file__).resolve().parents[1] / "scripts" / "claude_switch.py")); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 calls = []
 m.desktop_processes = lambda: [1234]          # Desktop 永远不退出
 m.run_hidden = lambda args, **k: calls.append(args)
+notified = []
+m.desktop_end_session = lambda pids: notified.append(list(pids)) or 1   # 不真的给 Desktop 发消息
 # 1. 用户点取消
 threading.Timer(2, lambda: m.CANCEL_FILE.write_text("1")).start()
 t = time.time()
@@ -28,3 +30,11 @@ except SystemExit: pass
 print("超时：", m.read_json(m.JOB_FILE)["state"], m.read_json(m.JOB_FILE)["message"])
 print("发出的命令：", [" ".join(c) for c in calls])
 print("有没有强制结束：", any("/F" in c for c in calls))
+print("通知会话结束：", notified)
+assert notified == [[1234], [1234]] and calls == [], "找得到窗口时应该只发会话结束通知，不用 taskkill"
+# 3. 找不到 Desktop 的窗口时退回 taskkill（不带 /F）
+m.desktop_end_session = lambda pids: 0
+try: m.desktop_quit(wait_user=0)
+except SystemExit: pass
+print("找不到窗口时：", [" ".join(c) for c in calls])
+assert calls == [["taskkill", "/PID", "1234"]]

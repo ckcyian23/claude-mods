@@ -1,4 +1,5 @@
 """把本仓库里的 skill 装到 ~/.claude/skills（目录链接，改仓库立即生效），并安装 bin/ 下的命令。
+插件（mods/ 下）不归这里装，见 README。
 
   python install.py            安装全部 skill
   python install.py NAME ...   只安装指定的 skill
@@ -22,6 +23,8 @@ except Exception:
 REPO = Path(__file__).resolve().parent
 SKILLS_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "skills"
 BIN_DIR = Path.home() / ".local" / "bin"
+# bin/ 里的命令是模板：__SCRIPT__ 换成切号脚本在本仓库里的实际路径
+SWITCH_SCRIPT = REPO / "mods" / "account-switch" / "scripts" / "claude_switch.py"
 
 
 def repo_skills():
@@ -72,7 +75,9 @@ def install_bin():
         return
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     for f in src.iterdir():
-        shutil.copy2(f, BIN_DIR / f.name)
+        dst = BIN_DIR / f.name
+        dst.write_bytes(f.read_bytes().replace(b"__SCRIPT__", str(SWITCH_SCRIPT).encode()))
+        shutil.copymode(f, dst)
         print(f"  命令：{f.name} -> {BIN_DIR}")
 
 

@@ -12,7 +12,6 @@
   claude_switch.py sync-sessions                        合并所有账号的 Desktop 会话列表（切号时会自动做）
   claude_switch.py rename <旧名字> <新名字>             给账号快照改名
   claude_switch.py remove <名字>                        删除一个账号快照
-  claude_switch.py ui                                   打开「Claude 切号」图形窗口
 
 Desktop 相关操作需要先退出 Claude Desktop；如果 Desktop 正在运行，会交给一个
 独立的后台进程执行（退出 → 处理 → 重新启动），所以从 Desktop 会话里调用也没问题。
@@ -20,6 +19,7 @@ Desktop 相关操作需要先退出 Claude Desktop；如果 Desktop 正在运行
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 try:
@@ -43,9 +44,13 @@ BACKUPS = DATA / "backups"
 LOG_FILE = DATA / "logs" / "claude-switch.log"
 LOCK_FILE = DATA / "switch.lock"
 CONFIG_FILE = DATA / "config.json"
-JOB_FILE = DATA / "job.json"      # 后台切换的进度，图形窗口读它显示
+JOB_FILE = DATA / "job.json"      # 后台切换的进度，切号面板读它显示
 CANCEL_FILE = DATA / "cancel"     # 存在就表示用户点了取消
+OWNER_CACHE = DATA / "cli-owner.json"  # 当前 CLI 凭证属于哪个账号（只存凭证的指纹，不存凭证本身）
+USAGE_FILE = DATA / "usage.json"  # 各账号离开时的额度
+API = "https://api.anthropic.com"
 KEEP_BACKUPS = 5
+FIVE_HOURS, SEVEN_DAYS = 5 * 3600, 7 * 86400
 
 # Desktop 登录态相关的条目（参考 cockpit-tools 的 CLAUDE_DESKTOP_PROFILE_ITEMS）。
 # claude_desktop_config.json（MCP 配置）故意不切换，所有账号共用。
@@ -160,7 +165,7 @@ def is_junction(p):
             return False
 
 
-NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW：从图形窗口调用时不弹出命令框
+NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW：从切号面板调用时不弹出命令框
 
 
 def run_hidden(args, **kw):
@@ -228,6 +233,7 @@ def save_meta(name, meta):
 
 
 def all_accounts():
+    """所有账号，按用户排好的顺序（config.json 的 order）；没排过的按名字放在后面。"""
     if not ACCOUNTS.exists():
         return []
     out = []
@@ -235,7 +241,40 @@ def all_accounts():
         m = read_json(d / "meta.json", None)
         if m:
             out.append(m)
-    return out
+    order = (read_json(CONFIG_FILE, {}) or {}).get("order") or []
+    rank = {n: i for i, n in enumerate(order)}
+    return sorted(out, key=lambda m: (rank.get(m["name"], len(order)), m["name"]))
+
+
+def set_order(names):
+    conf = read_json(CONFIG_FILE, {}) or {}
+    conf["order"] = names
+    write_json(CONFIG_FILE, conf)
+
+
+def pinned_account():
+    """Desktop 当前登录的账号，显示时固定在第一位。"""
+    return find_account("desktop", desktop_live_uuid())
+
+
+def ordered_accounts():
+    """显示用的顺序：Desktop 当前的号固定在第一，其余按用户排的顺序。"""
+    accts, pin = all_accounts(), pinned_account()
+    return [m for m in accts if m["name"] == pin] + [m for m in accts if m["name"] != pin]
+
+
+def move_account(name, step):
+    names = [m["name"] for m in ordered_accounts()]
+    if name not in names:
+        die(f"没有账号「{name}」")
+    pin = pinned_account()
+    if name == pin:
+        return  # 固定在第一的号不参与排序
+    lo = 1 if pin else 0
+    i = names.index(name)
+    j = max(lo, min(len(names) - 1, i + step))
+    names.insert(j, names.pop(i))
+    set_order(names)
 
 
 def find_account(kind, uuid):
@@ -245,6 +284,22 @@ def find_account(kind, uuid):
         if (m.get(kind) or {}).get("accountUuid") == uuid:
             return m["name"]
     return None
+
+
+def name_for_save(requested, uuid, email):
+    """保存时实际用的名字：这个账号已经存过（CLI、Desktop 任一边）就沿用原来的名字；
+    名字已经被别的账号占了就报错。"""
+    for m in all_accounts():
+        if uuid in ((m.get("cli") or {}).get("accountUuid"), (m.get("desktop") or {}).get("accountUuid")):
+            if m["name"] != requested:
+                log(f"这个账号（{email or '邮箱未知'}）已经存为「{m['name']}」，沿用原来的名字，没有另存为「{requested}」")
+            return m["name"]
+    meta = load_meta(requested) or {}
+    taken = {k: v for k in ("cli", "desktop") if (v := meta.get(k)) and v.get("accountUuid") not in (None, uuid)}
+    if taken:
+        other = next(iter(taken.values())).get("email")
+        die(f"名字「{requested}」已经被另一个账号（{other or '邮箱未知'}）用了，换个名字再保存")
+    return requested
 
 
 # ---------------------------------------------------------------- CLI
@@ -275,40 +330,134 @@ def cli_live():
     return creds.get("claudeAiOauth"), cfg.get("oauthAccount")
 
 
+def api_get(path, token, timeout=8):
+    req = urllib.request.Request(API + path, headers={
+        "Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-switch"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def token_valid(oauth):
+    return bool(oauth.get("accessToken")) and (oauth.get("expiresAt") or 0) / 1000 > time.time() + 60
+
+
+def cli_owner(online=True):
+    """当前 CLI 凭证真正属于哪个账号：{accountUuid, email, organizationUuid}，确认不了时返回 None。
+
+    ~/.claude.json 里的账号信息会被 Desktop 托管的会话改成 Desktop 的账号，不能拿来判断，所以看凭证本身：
+    刷新 token 和某个快照完全一样就是那个号；否则看缓存；再不行就问一次服务器（凭证换了才会再问）。"""
+    oauth, _ = cli_live()
+    if not oauth:
+        return None
+    rt = oauth.get("refreshToken")
+    for m in all_accounts():
+        snap = (read_json(ACCOUNTS / m["name"] / "cli" / "credentials.json", {}) or {}).get("claudeAiOauth") or {}
+        if rt and snap.get("refreshToken") == rt and m.get("cli"):
+            acc = read_json(ACCOUNTS / m["name"] / "cli" / "oauthAccount.json", {}) or {}
+            return {"accountUuid": m["cli"].get("accountUuid"), "email": m["cli"].get("email"),
+                    "organizationUuid": acc.get("organizationUuid")}
+    fp = hashlib.sha256((oauth.get("accessToken") or "").encode()).hexdigest()[:16]
+    cache = read_json(OWNER_CACHE, {}) or {}
+    if cache.get("fp") == fp and cache.get("accountUuid"):
+        return {k: cache.get(k) for k in ("accountUuid", "email", "organizationUuid")}
+    if not online or not token_valid(oauth):
+        return None
+    try:
+        p = api_get("/api/oauth/profile", oauth["accessToken"])
+    except Exception:
+        return None
+    acc, org = p.get("account") or {}, p.get("organization") or {}
+    owner = {"accountUuid": acc.get("uuid"), "email": acc.get("email"), "organizationUuid": org.get("uuid")}
+    if not owner["accountUuid"]:
+        return None
+    write_json(OWNER_CACHE, {"fp": fp, **owner, "checkedAt": now_stamp()})
+    return owner
+
+
+def cli_account_for(owner):
+    """要存进快照的账号信息（oauthAccount），保证和凭证是同一个账号。"""
+    _, live = cli_live()
+    if live and live.get("accountUuid") == owner["accountUuid"]:
+        return live
+    name = find_account("cli", owner["accountUuid"])
+    snap = read_json(ACCOUNTS / name / "cli" / "oauthAccount.json", None) if name else None
+    if snap:
+        return snap
+    return {"accountUuid": owner["accountUuid"], "emailAddress": owner["email"],
+            "organizationUuid": owner["organizationUuid"]}
+
+
+def usage_record(name, oauth):
+    """记下这个号此刻的额度（存快照时顺便查一次，只查这一个号）；查不到就算了。"""
+    if not token_valid(oauth):
+        return
+    try:
+        u = api_get("/api/oauth/usage", oauth["accessToken"])
+    except Exception:
+        return
+
+    def window(key):
+        w = u.get(key) or {}
+        reset = w.get("resets_at")
+        try:
+            reset = _dt.datetime.fromisoformat(reset).timestamp() if reset else None
+        except ValueError:
+            reset = None
+        return w.get("utilization"), reset
+
+    fh, fh_reset = window("five_hour")
+    sd, sd_reset = window("seven_day")
+    data = read_json(USAGE_FILE, {}) or {}
+    data[name] = {"fh": fh, "fhReset": fh_reset, "sd": sd, "sdReset": sd_reset, "at": time.time()}
+    write_json(USAGE_FILE, data)
+
+
 def cli_save(name):
-    oauth, account = cli_live()
-    if not oauth or not account:
-        die("CLI 当前没有登录（缺少 claudeAiOauth 或 oauthAccount）。先运行 claude 并 /login。")
-    other = find_account("cli", account.get("accountUuid"))
-    if other and other != name:
-        die(f"CLI 当前账号已经存为「{other}」了，不能再存成「{name}」")
+    oauth, _ = cli_live()
+    owner = cli_owner() if oauth else None
+    if not owner:
+        die("确认不了 CLI 当前登录的是哪个账号（没有登录，或者凭证已过期又没法联网确认）。"
+            "先运行一次 claude（没登录就 /login），再保存。")
+    account = cli_account_for(owner)
+    name = name_for_save(name, owner["accountUuid"], owner["email"])
     d = account_dir(name)
     write_json(d / "cli" / "credentials.json", {"claudeAiOauth": oauth})
     write_json(d / "cli" / "oauthAccount.json", account)
     meta = load_meta(name) or {}
     meta["cli"] = {
-        "accountUuid": account.get("accountUuid"),
-        "email": account.get("emailAddress"),
+        "accountUuid": owner["accountUuid"],
+        "email": account.get("emailAddress") or owner["email"],
         "subscriptionType": oauth.get("subscriptionType"),
         "savedAt": now_stamp(),
     }
     save_meta(name, meta)
-    log(f"CLI：已保存当前账号为「{name}」（{account.get('emailAddress')}）")
+    cfg_path = cli_global_config_path()
+    cfg = read_json(cfg_path, {}) or {}
+    if (cfg.get("oauthAccount") or {}).get("accountUuid") != owner["accountUuid"]:
+        cfg["oauthAccount"] = account  # 账号信息和凭证对不上时，改成凭证真正所属的账号
+        write_json(cfg_path, cfg)
+        log(f"CLI：{cfg_path.name} 里的账号信息和登录凭证对不上，已改成「{name}」")
+    usage_record(name, oauth)
+    log(f"CLI：已保存当前账号为「{name}」（{meta['cli']['email']}）")
+    return name
 
 
 def cli_refresh_current():
-    """切走之前，把当前 CLI 账号最新的 token 写回它自己的快照（token 会轮换）。"""
+    """切走之前，把当前 CLI 账号最新的 token 写回它自己的快照（token 会轮换）。
+    确认不了凭证属于哪个号时不写任何快照，只备份，避免把 A 的凭证写进 B 的快照。"""
     oauth, account = cli_live()
-    if not oauth or not account:
+    if not oauth:
         return None
-    cur = find_account("cli", account.get("accountUuid"))
+    owner = cli_owner()
+    cur = find_account("cli", owner["accountUuid"]) if owner else None
     if cur:
         cli_save(cur)
     else:
         bk = BACKUPS / f"cli-{now_stamp()}"
         write_json(bk / "credentials.json", {"claudeAiOauth": oauth})
-        write_json(bk / "oauthAccount.json", account)
-        log(f"CLI：当前登录的账号还没存过快照，已备份到 {bk}")
+        write_json(bk / "oauthAccount.json", account or {})
+        why = "当前登录的账号还没存过快照" if owner else "确认不了当前凭证属于哪个账号，没有写回任何快照"
+        log(f"CLI：{why}，已备份到 {bk}")
     return cur
 
 
@@ -476,6 +625,50 @@ def cancel_requested():
     return False
 
 
+def desktop_windows(pids):
+    """Desktop 进程的顶层窗口（包括缩到托盘后隐藏的那些）。"""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    targets, found = set(pids), []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def collect(hwnd, _):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in targets:
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, cls, 64)
+            if cls.value.startswith("Chrome_WidgetWin"):  # Electron 的窗口
+                found.append(hwnd)
+        return True
+
+    user32.EnumWindows(collect, 0)
+    return found
+
+
+def desktop_end_session(pids):
+    """像 Windows 注销时那样通知 Desktop 的窗口（WM_QUERYENDSESSION → WM_ENDSESSION）。
+
+    点关闭按钮或 taskkill（不带 /F）只会让 Desktop 缩到托盘；它只在收到"会话结束"时调用自己的退出流程，
+    和右键托盘点「退出」一样，不是强制结束。返回通知到的窗口数。"""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    send = user32.SendMessageTimeoutW
+    send.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                     wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+    send.restype = ctypes.c_ssize_t
+    WM_QUERYENDSESSION, WM_ENDSESSION, ENDSESSION_CLOSEAPP, SMTO_ABORTIFHUNG = 0x11, 0x16, 0x1, 0x2
+    hwnds = desktop_windows(pids)
+    for hwnd in hwnds:
+        answer = ctypes.c_size_t()
+        if send(hwnd, WM_QUERYENDSESSION, 0, ENDSESSION_CLOSEAPP, SMTO_ABORTIFHUNG, 3000, ctypes.byref(answer)) \
+                and answer.value:  # 窗口同意结束才发 WM_ENDSESSION
+            send(hwnd, WM_ENDSESSION, 1, ENDSESSION_CLOSEAPP, SMTO_ABORTIFHUNG, 3000, ctypes.byref(answer))
+    return len(hwnds)
+
+
 def desktop_quit(force=False, wait_user=180):
     """正常退出 Claude Desktop；默认绝不强制结束。退不掉就等用户自己退出，超时或取消则什么都不改。"""
     pids = desktop_processes()
@@ -484,10 +677,11 @@ def desktop_quit(force=False, wait_user=180):
     msg = "正在正常退出 Claude Desktop（不会强制结束）…"
     log("Desktop：" + msg)
     set_job("quitting", msg)
-    args = ["taskkill"]
-    for pid in pids:
-        args += ["/PID", str(pid)]
-    run_hidden(args)  # 不带 /F：相当于点窗口的关闭按钮，Desktop 可以自己询问是否退出
+    if not desktop_end_session(pids):
+        args = ["taskkill"]
+        for pid in pids:
+            args += ["/PID", str(pid)]
+        run_hidden(args)  # 找不到窗口时退回老办法：不带 /F，相当于点窗口的关闭按钮
     deadline = time.time() + 15
     while time.time() < deadline and desktop_processes():
         if cancel_requested():
@@ -550,9 +744,9 @@ def desktop_save(name):
     uuid = cfg.get("lastKnownAccountUuid")
     if not uuid or not any(k.startswith(DESKTOP_CONFIG_AUTH_PREFIX) for k in cfg):
         die("Desktop 当前没有登录")
-    other = find_account("desktop", uuid)
-    if other and other != name:
-        die(f"Desktop 当前账号已经存为「{other}」了，不能再存成「{name}」")
+    known = next(((m.get(k) or {}).get("email") for m in all_accounts() for k in ("desktop", "cli")
+                  if (m.get(k) or {}).get("accountUuid") == uuid and (m.get(k) or {}).get("email")), None)
+    name = name_for_save(name, uuid, known)
     d = account_dir(name)
     tmp = d / "desktop.ccs-tmp"
     remove_path(tmp)
@@ -565,9 +759,7 @@ def desktop_save(name):
     remove_path(final)
     os.replace(tmp, final)
     meta = load_meta(name) or {}
-    cli_acc = cli_live()[1] or {}
-    email = (cli_acc.get("emailAddress") if cli_acc.get("accountUuid") == uuid else None) \
-        or (meta.get("desktop") or {}).get("email") or find_desktop_email(final, uuid)
+    email = known or (meta.get("desktop") or {}).get("email") or find_desktop_email(final, uuid)
     meta["desktop"] = {"accountUuid": uuid, "email": email, "savedAt": now_stamp()}
     save_meta(name, meta)
     log(f"Desktop：已保存当前账号为「{name}」（{email or '邮箱未知'}）")
@@ -760,13 +952,6 @@ def wmi_launch(cmd):
         die(f"启动后台进程失败：{out}")
 
 
-def open_ui():
-    """打开「Claude 切号」窗口；已经开着就把它叫到最前面（由 claude_switch_ui.py 处理）。"""
-    ui = Path(__file__).resolve().with_name("claude_switch_ui.py")
-    wmi_launch(f'"{pythonw()}" -I "{ui}"')
-    log("已打开「Claude 切号」窗口（已经开着的话会切到最前面）")
-
-
 def spawn_worker(job, name, delay, force=False):
     """用 WMI 启动一个脱离 Claude Desktop 进程树的后台进程，Desktop 退出时不会被一起结束。"""
     cmd = f'"{pythonw()}" -I "{Path(__file__).resolve()}" _worker {job} --delay {delay}'
@@ -805,12 +990,60 @@ def desktop_dispatch(job, name, force=False):
             run_desktop_job(job, name)
 
 
+def desktop_usage_records():
+    """Desktop 自己记的额度（plan-usage-history.json）：每个组织最后一条，{org: {fh, sd, at}}。"""
+    try:
+        with open(desktop_dir() / "plan-usage-history.json", encoding="utf-8") as f:
+            hist = json.load(f)
+    except (OSError, ValueError, SystemExit):
+        return {}
+    last = {}
+    for s in hist.get("samples") or []:
+        org, t = s.get("org"), s.get("t") or 0
+        if org and t >= last.get(org, {}).get("t", 0):
+            last[org] = s
+    return {org: {"fh": (s.get("u") or {}).get("fh"), "sd": (s.get("u") or {}).get("sd"), "at": s["t"] / 1000}
+            for org, s in last.items()}
+
+
+def account_orgs(m):
+    orgs = set()
+    acc = read_json(ACCOUNTS / m["name"] / "cli" / "oauthAccount.json", {}) or {}
+    if acc.get("organizationUuid"):
+        orgs.add(acc["organizationUuid"])
+    d_uuid = (m.get("desktop") or {}).get("accountUuid")
+    orgs.update(o.name for o in org_dirs() if o.parent.name == d_uuid)
+    return orgs
+
+
+def usage_for(m, records, saved):
+    """这个号最近一次知道的额度。额度窗口到点了就当作已恢复（显示 0），不联网。"""
+    cands = [records[o] for o in account_orgs(m) if o in records]
+    api = saved.get(m["name"])
+    if api:
+        cands.append(api)
+    if not cands:
+        return None
+    best = max(cands, key=lambda c: c["at"])
+    now, out = time.time(), {"at": best["at"]}
+    for key, span in (("fh", FIVE_HOURS), ("sd", SEVEN_DAYS)):
+        reset = api.get(key + "Reset") if api and (api.get(key + "Reset") or 0) > best["at"] else None
+        is_reset = now >= reset if reset else now - best["at"] >= span
+        out[key] = 0 if is_reset else best.get(key)
+        out[key + "Reset"] = None if is_reset else reset
+        out[key + "IsReset"] = is_reset
+    return out
+
+
 def status_data():
+    owner = cli_owner()
     _, cli_acc = cli_live()
     cli_acc = cli_acc or {}
+    cli_uuid = owner["accountUuid"] if owner else cli_acc.get("accountUuid")
     d_uuid = desktop_live_uuid()
+    records, saved = desktop_usage_records(), read_json(USAGE_FILE, {}) or {}
     accounts = []
-    for m in all_accounts():
+    for m in ordered_accounts():
         c, d = m.get("cli") or {}, m.get("desktop") or {}
         accounts.append({
             "name": m["name"],
@@ -820,11 +1053,13 @@ def status_data():
             "cliEmail": c.get("email"),
             "desktopEmail": d.get("email"),
             "plan": c.get("subscriptionType"),
+            "usage": usage_for(m, records, saved),
         })
     running = bool(desktop_processes())
     return {
-        "cli": {"current": find_account("cli", cli_acc.get("accountUuid")),
-                "email": cli_acc.get("emailAddress"), "loggedIn": bool(cli_acc)},
+        "cli": {"current": find_account("cli", cli_uuid),
+                "email": owner["email"] if owner else cli_acc.get("emailAddress"),
+                "loggedIn": bool(cli_live()[0]), "verified": bool(owner)},
         "desktop": {"current": find_account("desktop", d_uuid), "email": desktop_email_for(d_uuid),
                     "loggedIn": bool(d_uuid), "running": running,
                     "activity": desktop_activity() if running else {"open": 0, "recent": []}},
@@ -853,6 +1088,13 @@ def print_status(st):
         print(f"  {i}. {a['name']}  {a['email'] or '邮箱未知'}"
               f"{'  ' + a['plan'] if a['plan'] else ''}  [已保存：{'、'.join(parts)}]"
               f"{'  ← ' + '、'.join(mark) if mark else ''}")
+        u = a.get("usage")
+        if u:
+            fmt = lambda k: "已恢复" if u[k + "IsReset"] else f"{round(u[k] or 0)}%"
+            print(f"     额度：5 小时 {fmt('fh')} · 本周 {fmt('sd')}"
+                  f"（记录于 {_dt.datetime.fromtimestamp(u['at']):%m-%d %H:%M}）")
+    if c["loggedIn"] and not c.get("verified", True):
+        print("注意：确认不了 CLI 当前凭证属于哪个账号（凭证已过期且没法联网），上面的 CLI 当前按 ~/.claude.json 显示，可能不准")
     s = st["sessions"]
     if s["links"]:
         state = "还有旧版的目录链接，Desktop 存不了会话，请运行 sync-sessions 修复"
@@ -899,7 +1141,6 @@ def main():
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("status")
     p.add_argument("--json", action="store_true")
-    sub.add_parser("ui")
     def desktop_flags(p):
         p.add_argument("--yes", action="store_true", help="确认要退出 Claude Desktop")
         p.add_argument("--force", action="store_true", help="Desktop 退不掉时强制结束（默认绝不强制）")
@@ -918,6 +1159,9 @@ def main():
     p.add_argument("new")
     p = sub.add_parser("remove")
     p.add_argument("name")
+    p = sub.add_parser("move")
+    p.add_argument("name")
+    p.add_argument("direction", choices=["up", "down"])
     p = sub.add_parser("_worker")
     p.add_argument("job")
     p.add_argument("--name")
@@ -933,8 +1177,6 @@ def main():
     elif a.cmd == "status":
         st = status_data()
         print(json.dumps(st, ensure_ascii=False)) if a.json else print_status(st)
-    elif a.cmd == "ui":
-        open_ui()
     elif a.cmd == "cancel":
         DATA.mkdir(parents=True, exist_ok=True)
         CANCEL_FILE.write_text("1")
@@ -948,7 +1190,16 @@ def main():
         os.replace(src, dst)
         meta = load_meta(a.new)
         save_meta(a.new, meta)
+        usage = read_json(USAGE_FILE, {}) or {}
+        if a.old in usage:  # 额度记录按名字存，跟着改
+            usage[a.new] = usage.pop(a.old)
+            write_json(USAGE_FILE, usage)
+        order = (read_json(CONFIG_FILE, {}) or {}).get("order") or []
+        if a.old in order:  # 排序也跟着改
+            set_order([a.new if n == a.old else n for n in order])
         log(f"已把账号「{a.old}」改名为「{a.new}」")
+    elif a.cmd == "move":
+        move_account(a.name, -1 if a.direction == "up" else 1)
     elif a.cmd == "remove":
         d = account_dir(a.name)
         if not d.exists():
@@ -981,7 +1232,7 @@ def main():
             account_dir(name)
         parts = [a.only] if a.only else ["cli", "desktop"]
         if a.cmd == "save" and not a.only:
-            cli_uuid = (cli_live()[1] or {}).get("accountUuid")
+            cli_uuid = (cli_owner() or {}).get("accountUuid") if cli_live()[0] else None
             d_uuid = desktop_live_uuid()
             if cli_uuid and d_uuid and cli_uuid != d_uuid:
                 die("CLI 和 Desktop 当前登录的不是同一个账号，请分别用 --only cli / --only desktop 保存")

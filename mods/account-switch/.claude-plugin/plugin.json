@@ -1,0 +1,6 @@
+{
+  "name": "account-switch",
+  "version": "0.1.0",
+  "description": "切换 Claude 账号（CLI 和 Desktop），/claude-switch 直接执行、不经过模型；面板里点按钮切号",
+  "types": "./types/index.d.ts"
+}

@@ -1,6 +1,6 @@
 """沙盒测试：用假的 HOME、假的 Desktop 目录和假 token 跑完整流程，不碰真实登录态，也不会关掉真实的 Desktop。
 
-  python -I tests/claude-switch/test_switch.py
+  python -I mods/account-switch/tests/test_switch.py
 """
 import os, tempfile, sys, json, shutil, importlib.util
 from pathlib import Path
@@ -27,9 +27,21 @@ w(dd/f"claude-code-sessions/{A}/{ORG_A}/local_s1.json", {"t": "A1"})
 w(dd/f"claude-code-sessions/{B}/{ORG_B}/local_s2.json", {"t": "B1"})
 w(dd/"claude_desktop_config.json", {"mcp": "shared"})
 
-spec = importlib.util.spec_from_file_location("ccs", str(Path(__file__).resolve().parents[2] / "claude-switch" / "claude_switch.py")); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+spec = importlib.util.spec_from_file_location("ccs", str(Path(__file__).resolve().parents[1] / "scripts" / "claude_switch.py")); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 m.desktop_processes = lambda: []
 m.desktop_launch = lambda: m.log("(测试) 假装启动 Desktop")
+# 不联网：假的服务器按 token 前缀回答账号归属和额度
+OWNERS = {"TOKA": (A, "a@x.com", ORG_A), "TOKB": (B, "b@x.com", ORG_B), "TOKC": ("c" * 8 + "-3333-3333-3333-333333333333", "c@x.com", ORG_B)}
+API_CALLS = []
+def fake_api(path, token, timeout=8):
+    API_CALLS.append(path)
+    uuid, email, org = OWNERS[token[:4]]
+    if path == "/api/oauth/profile":
+        return {"account": {"uuid": uuid, "email": email}, "organization": {"uuid": org}}
+    return {"five_hour": {"utilization": 40.0, "resets_at": "2099-01-01T00:00:00+00:00"},
+            "seven_day": {"utilization": 12.0, "resets_at": "2000-01-01T00:00:00+00:00"}}
+m.api_get = fake_api
+m.token_valid = lambda oauth: bool(oauth.get("accessToken"))
 def run(*args):
     print("\n$ claude_switch", *args); sys.argv = ["x", *args]
     try: m.main()
@@ -81,7 +93,39 @@ check(not m.is_junction(dd/f"claude-code-sessions/{B}/{ORG_B}"), "切号后仍�
 run("use", "__ckcyi")
 check(rd(home/".claude/.credentials.json")["claudeAiOauth"]["accessToken"] == "TOKA-NEW", "切回 A 时拿到轮换后的 CLI token")
 check(rd(dd/"config.json")["oauth:tokenCache"] == "DTOKA-NEW", "切回 A 时拿到最新的 Desktop 登录态")
-run("save", "_ckcyi")  # A 已存为 acctA，应拒绝
+run("save", "_ckcyi", "--only", "cli")  # A 已经存为 __ckcyi：沿用原来的名字，不能把 A 存进 B 的名字
+check(m.load_meta("_ckcyi")["cli"]["accountUuid"] == B and m.load_meta("__ckcyi")["cli"]["accountUuid"] == A,
+      "保存时名字写错了：已有的账号沿用原来的名字，不会覆盖别的号")
+import time
+check(rd(home/".claude-switch/usage.json")["__ckcyi"]["fh"] == 40.0, "保存时顺便记下了这个号的额度")
+now = time.time()  # 两小时前记的：5 小时窗口还没到点，本周窗口一分钟前刚重置
+w(home/".claude-switch/usage.json", {"__ckcyi": {"fh": 40.0, "fhReset": now + 3600, "sd": 12.0, "sdReset": now - 60, "at": now - 7200}})
+u = m.status_data()["accounts"][0]["usage"]
+check(u["fh"] == 40.0 and not u["fhIsReset"] and u["sd"] == 0 and u["sdIsReset"], "额度：没到点的照常显示，到点重置的显示为已恢复")
+# Desktop 托管的会话把 ~/.claude.json 改成了别的号：CLI 当前要按凭证本身判断，切走时不能把 A 的凭证写进 B 的快照
+cfg = rd(home/".claude.json"); cfg["oauthAccount"] = {"accountUuid": B, "emailAddress": "b@x.com"}; w(home/".claude.json", cfg)
+w(home/".claude/.credentials.json", {"claudeAiOauth": {"accessToken": "TOKA-ROTATED"}, "other": 1})
+check(m.status_data()["cli"]["current"] == "__ckcyi", "账号信息和凭证对不上时，按凭证认出 CLI 当前是 A")
+run("use", "_ckcyi", "--only", "cli")
+check(rd(home/".claude-switch/accounts/_ckcyi/cli/credentials.json")["claudeAiOauth"]["accessToken"] == "TOKB"
+      and rd(home/".claude-switch/accounts/__ckcyi/cli/credentials.json")["claudeAiOauth"]["accessToken"] == "TOKA-ROTATED",
+      "错位时切号：A 的新凭证写回 A，B 的快照不受影响")
+# 新账号 C 想用已经被 B 占用的名字：要提醒并拒绝
+login_cli("c" * 8 + "-3333-3333-3333-333333333333", "c@x.com", "TOKC")
+run("save", "_ckcyi", "--only", "cli")
+check(m.load_meta("_ckcyi")["cli"]["accountUuid"] == B, "名字被别的号占用时拒绝保存")
+run("use", "__ckcyi", "--only", "cli")
+names = lambda: [a["name"] for a in m.status_data()["accounts"]]
+check(m.pinned_account() == "__ckcyi" and names() == ["__ckcyi", "_ckcyi"], "Desktop 当前的号排在第一")
+w(home/".claude-switch/accounts/甲/meta.json", {"name": "甲"})
+check(names() == ["__ckcyi", "_ckcyi", "甲"], "（准备）第三个号排在后面")
+run("move", "甲", "up")
+check(names() == ["__ckcyi", "甲", "_ckcyi"], "其余的号之间可以调整顺序")
+run("move", "甲", "up")
+check(names() == ["__ckcyi", "甲", "_ckcyi"], "不能挪到 Desktop 当前的号前面")
+run("move", "__ckcyi", "down")
+check(names()[0] == "__ckcyi", "Desktop 当前的号固定在第一，不参与排序")
+shutil.rmtree(home/".claude-switch/accounts/甲")
 run("status")
 check(not list((root).rglob("*.ccs-tmp")), "没有残留临时文件")
 print("\n结果：", "有失败" if check.fail else "全部通过")
