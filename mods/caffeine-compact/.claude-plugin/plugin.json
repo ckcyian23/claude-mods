@@ -1,0 +1,20 @@
+{
+  "name": "caffeine-compact",
+  "version": "0.1.1",
+  "description": "保活 + 自动压缩二合一：上下文不大不管；超过大小线时，没开保活就在 prompt cache 过期前自动压缩，开了保活就保活一段固定时长，期间你没发新消息就在 cache 过期前压缩并关闭保活。基于 lperezmo/cache-caffeine（MIT）。",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "band": {
+      "type": "string",
+      "title": "状态栏显示",
+      "description": "输入框上方那一行：auto 有事才显示（保活开着、压缩快到点或正在压缩），on 一直显示，off 不显示",
+      "default": "auto",
+      "options": [
+        "auto",
+        "on",
+        "off"
+      ]
+    }
+  }
+}

@@ -1,5 +1,16 @@
 {
   "name": "ckcyi-mods",
-  "owner": { "name": "ckcyi" },
-  "plugins": [{ "name": "account-switch", "source": "./mods/account-switch" }]
+  "owner": {
+    "name": "ckcyi"
+  },
+  "plugins": [
+    {
+      "name": "account-switch",
+      "source": "./mods/account-switch"
+    },
+    {
+      "name": "caffeine-compact",
+      "source": "./mods/caffeine-compact"
+    }
+  ]
 }

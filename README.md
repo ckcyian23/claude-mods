@@ -7,6 +7,7 @@
 | 插件 | 作用 | 依赖 |
 | --- | --- | --- |
 | [account-switch](mods/account-switch/README.md) | 一键切换 Claude 账号（CLI 和 Desktop 都切），切号时自动合并各账号的 Desktop 会话列表。在 Claude 里输入 `/claude-switch` 打开切号面板。 | Python 3.12+ |
+| [caffeine-compact](mods/caffeine-compact/README.md) | 保活 + 自动压缩二合一：上下文不大不管；超过大小线时，没开保活就在 cache 过期前压缩，开了保活就保活一段时间，到点转入压缩。命令 `/caffeine`。 | 无 |
 
 根目录的 `.claude-plugin/marketplace.json` 把本仓库登记成本地插件市场 `ckcyi-mods`。先把它加进来：
 
