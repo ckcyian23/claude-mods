@@ -1,4 +1,4 @@
-# claude-skills
+# claude-mods
 
 我自己的 Claude Code 扩展库：插件放在 `mods/`，skill 放在仓库根目录（每个带 `SKILL.md` 的文件夹算一个）。
 
