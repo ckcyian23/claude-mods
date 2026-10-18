@@ -105,6 +105,10 @@ let sessionCost: number | undefined
 let stepCost = 0
 // the triggers of the compactions that ran
 const compactions: string[] = []
+const logs: string[] = []
+const compactCommands: string[] = []
+// when set, $.session.compact fails with this (a headless session has none)
+let compactError: string | null = null
 
 // The engine beneath caffeine: the UI ops, the prompts it submits, the turns.
 function world(on: On, submitted: string[], crons: { cron: string; prompt: string }[] = [], pushed: string[] = []) {
@@ -122,7 +126,10 @@ function world(on: On, submitted: string[], crons: { cron: string; prompt: strin
     return { deny: 'unexpected' }
   })
   on('ui.toast', () => ({ value: undefined }))
-  on('ui.log', () => ({ value: undefined }))
+  on('ui.log', ($, e) => {
+    logs.push(String((e as { text?: string }).text ?? JSON.stringify(e)))
+    return { value: undefined }
+  })
   on('ui.invalidate', () => ({ value: undefined }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.focus', () => ({}))
@@ -136,8 +143,13 @@ function world(on: On, submitted: string[], crons: { cron: string; prompt: strin
     submitted.push(e.text)
     return { text: e.text }
   })
+  on('command.run', ($, e) => {
+    if (e.command === 'compact') compactCommands.push(e.args)
+    return { text: '' }
+  })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('session.compact', ($, e) => {
+    if (compactError) return { skip: compactError } as never
     compactions.push(String(e.trigger ?? 'plugin'))
     return { messages: e.messages ?? [{ role: 'user', text: 'the summary', toolUses: [] }] } as never
   })
@@ -863,4 +875,62 @@ test('band auto: hidden until there is something to show; on and off are fixed',
   expect(await drawn()).toContain('caffeine off')
   await run($, 'band off')
   expect(await drawn()).not.toContain('caffeine')
+})
+
+test('compact now: runs once through the plugin and reports', async ($, on) => {
+  mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, {})
+  compactions.length = 0
+  world(on, [])
+  await $.session.start({ cwd: 'D:\work', surface: 'terminal', isInteractive: true })
+  await measure($, 250_000)
+  await turn($, 't1', 'work')
+  expect((await run($, 'compact now')).text).toContain('开始压缩')
+  await new Promise(resolve => setTimeout(resolve, 0))
+  expect((await run($, 'help')).text).toContain('compact now')
+})
+
+test('where $.session.compact is not available, it runs /compact, without counting as your turn', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  const submitted: string[] = []
+  compactions.length = 0
+  compactError = '$.session.compact: not available in a headless (-p / SDK) session yet'
+  world(on, submitted)
+  await $.session.start({ cwd: 'D:\work', surface: 'terminal', isInteractive: true })
+  await measure($, 250_000)
+  await turn($, 't1', 'work')
+  await time.advance(56 * MIN)
+  expect(submitted.length).toBe(0)
+  expect(compactCommands.length).toBe(1)
+  expect(compactCommands[0]).toContain('压缩')
+  // its own turn, then the compaction event: done, held until your next message
+  compactError = null
+  await $.turn.start({ text: 'summarize', turnId: 'c1' })
+  await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'the summary', toolUses: [] }] } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 900, isAborted: false, turnId: 'c1', reason: 'answer' } as never)
+  expect((await run($, 'status')).text).toContain('已压缩 1 次')
+  await time.advance(70 * MIN)
+  expect(compactCommands.length).toBe(1)
+})
+
+test('log keeps every event; notify quiet and normal report through /caffeine', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, {})
+  compactions.length = 0
+  world(on, [])
+  await $.session.start({ cwd: 'D:\work', surface: 'terminal', isInteractive: true })
+  await measure($, 250_000)
+  await turn($, 't1', 'work')
+  await run($, 'compact now')
+  await time.advance(100)
+  expect((await run($, 'log')).text).toContain('压缩开始')
+  expect((await run($, 'notify normal')).text).toContain('normal')
+  expect((await run($, 'notify')).text).toContain('normal')
+  expect((await run($, 'notify quiet')).text).toContain('quiet')
+  expect((await run($, 'log clear')).text).toContain('清空')
+  expect((await run($, 'log')).text).toContain('空')
 })

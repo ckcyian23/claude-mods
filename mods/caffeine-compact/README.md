@@ -38,10 +38,13 @@
 | 命令 | 作用 |
 | --- | --- |
 | `/caffeine compact on\|off` | 自动压缩开关（默认开） |
+| `/caffeine compact now` | 立刻压缩一次，用来测试；结果或失败原因以提示显示 |
 | `/caffeine size 300k` | 大小线，低于它不自动压缩（不影响手动开的保活）（`default` 恢复 200k） |
 | `/caffeine idle 2h` | 保活时长：从你最后一条消息算起，到点关保活、转入压缩 |
 | `/caffeine warm 2h` / `until 18:00` | 按绝对时间保活，到点同样转入压缩 |
 | `/caffeine status` | 当前状态，含压缩计划和已压缩次数 |
+| `/caffeine log [n]` / `log clear` | 看最近 n 条（默认 30）事件日志 / 清空；日志存在插件的存储里，最多留 300 条，重启后还在 |
+| `/caffeine notify quiet\|normal` | 弹窗多少：`quiet`（默认）只弹失败、压缩完成、保活结束；`normal` 全弹。不管哪种，所有事件都写进日志。也在 `/plugin` 配置菜单里 |
 
 其余命令（`on`、`off`、`every`、`ttl`、`wake` 等）见 `/caffeine help`。
 
@@ -49,6 +52,7 @@
 
 - `forever`（不设保活终点）不会转入压缩，因为保活一直开着。
 - 排了唤醒（wake）时不压缩。用量超过 90%/95% 时也不压缩。
+- Desktop、`-p`、SDK 这类会话没有直接压缩的接口，插件会自动改成运行 `/compact` 命令来压缩，效果一样，但它是一个独立的回合，要等会话空闲才会执行。
 - 压缩时给摘要加了说明，开头会写明这是自动压缩，并要求保留未完成任务、决定、文件路径等。
 - 和原版 cache-caffeine、Compact On Idle、Idle Compact 不要同时装，会互相打架。
 - 新增的提示文字是中文，原来的部分仍是英文。

@@ -97,6 +97,14 @@ type Caffeine = Brew & {
   // compaction before the cache expires: on or off, the context size it starts at,
   // a compaction running, the cache epoch (lastAt) it was last tried for, and how many ran
   isCompacting: boolean
+  // this session cannot call $.session.compact (headless/desktop): compact by running /compact
+  compactAsPrompt: boolean
+  // that /compact prompt is submitted and not finished yet
+  compactSent: boolean
+  compactSentAt: number
+  // the /compact turn has started (the first turn after it was sent)
+  compactTurn: boolean
+  compactManual: boolean
   compactOn: boolean
   size: number
   compactTried: number
@@ -131,10 +139,30 @@ function ttlSource(c: Caffeine): string {
 const everyOf = (c: Caffeine) => c.every ?? defaultEvery(ttlOf(c))
 const ttlLabel = (ms: number) => (ms >= TTL_1H ? '1h' : '5m')
 
-// Says how it went: a toast, and a line in the transcript that outlasts it.
-function tell($: EngineInterface, text: string): void {
-  $.ui.toast(`caffeine: ${text}`)
-  $.ui.log(`caffeine: ${text}`)
+// Every message lands in a kept log (/caffeine log). Only alerts (a failure, a keep-alive that
+// ended, a finished compaction) toast in quiet mode; normal mode toasts everything.
+const LOG_MAX = 300
+let notifyMode: 'quiet' | 'normal' = 'quiet'
+let logBuf: string[] = []
+
+function stamp(): string {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+function record($: EngineInterface, text: string): void {
+  logBuf.push(`${stamp()} ${text}`)
+  if (logBuf.length > LOG_MAX) logBuf = logBuf.slice(-LOG_MAX)
+  void Promise.resolve($.store.set('log', logBuf)).catch(() => undefined)
+}
+
+function tell($: EngineInterface, text: string, isAlert = false): void {
+  record($, text)
+  if (isAlert || notifyMode === 'normal') {
+    $.ui.toast(`caffeine: ${text}`)
+    $.ui.log(`caffeine: ${text}`)
+  }
 }
 
 async function setting<T>($: EngineInterface, key: string, fallback: T): Promise<T> {
@@ -153,6 +181,9 @@ async function load($: EngineInterface, c: Caffeine): Promise<void> {
   c.ttl = (await setting($, 'ttl', null)) as number | null
   c.autoAt = await setting($, 'autoAt', 0)
   c.compactOn = await setting($, 'compact', true)
+  const savedNotify = await setting<string | null>($, 'notify', null)
+  if (savedNotify === 'quiet' || savedNotify === 'normal') notifyMode = savedNotify
+  logBuf = await setting<string[]>($, 'log', [])
   c.size = (await setting($, 'size', DEFAULT_SIZE)) || DEFAULT_SIZE
   // merged settings, as Claude Code reads them; a failed read leaves the key unset
   let promptCacheTtl: unknown
@@ -280,6 +311,7 @@ async function switchOn($: EngineInterface, c: Caffeine, isOn: boolean, until = 
 function poke($: EngineInterface, c: Caffeine, now: number): void {
   c.poke = 'sent'
   c.sentAt = now
+  record($, `保活 poke（上下文 ${sized(c.context)}）`)
   void $.prompt.submit({ text: c.message }).catch(() => {
     c.poke = 'none'
   })
@@ -290,24 +322,61 @@ const COMPACT_NOTE = (at: string, idleMin: number) =>
   '摘要开头先说明这一点。保留未完成的任务、决定及其理由、带日期的待办、改过的文件路径，以及用户要求记住的内容。'
 
 // Compacts while the cache is still warm, so the summary pass reads it instead of writing it.
-function compactNow($: EngineInterface, c: Caffeine, now: number): void {
+// Where the host has no $.session.compact (the desktop app, -p, the SDK), it submits a /compact
+// command instead (a prompt may not begin with /); that runs as a turn of its own and ends with the session.compact event.
+function compactNow($: EngineInterface, c: Caffeine, now: number, isManual = false): void {
   c.compactTried = c.lastAt
   c.isCompacting = true
-  const idleMin = Math.round((now - c.lastAt) / MINUTE)
+  c.compactManual = isManual
+  const idleMin = c.lastAt ? Math.round((now - c.lastAt) / MINUTE) : 0
+  const instructions = isManual ? '这次压缩是用户用 /caffeine compact now 手动触发的。保留未完成的任务、决定及其理由、改过的文件路径，以及用户要求记住的内容。' : COMPACT_NOTE(clock(now, now), idleMin)
+  const what = isManual ? '手动压缩' : '自动压缩'
+  record($, `${what}开始（上下文 ${sized(c.context)}，离上次请求 ${idleMin} 分钟）`)
+  const failed = (err: unknown) => {
+    tell($, `${what}失败：${err instanceof Error ? err.message : String(err)}`, true)
+    c.isCompacting = false
+    c.compactSent = false
+    void refresh($, c)
+  }
+  const asPrompt = () => {
+    c.compactSent = true
+    c.compactTurn = false
+    c.compactSentAt = now
+    void refresh($, c)
+    void $.command.run({ command: 'compact', args: instructions }).catch(failed)
+  }
+  if (c.compactAsPrompt) {
+    asPrompt()
+    return
+  }
   void $.session
-    .compact({ instructions: COMPACT_NOTE(clock(now, now), idleMin) })
+    .compact({ instructions })
     .then(result => {
+      if (result.messages === undefined) {
+        // vetoed (a PreCompact hook, or no compaction in this session): fall back or say why
+        const why = 'skip' in result && typeof result.skip === 'string' ? result.skip : '压缩被跳过'
+        if (/headless|not available/i.test(why)) {
+          c.compactAsPrompt = true
+          asPrompt()
+        } else {
+          failed(new Error(why))
+        }
+        return
+      }
       c.compacts += 1
       const before = result.tokensBefore ?? c.context
       const after = result.tokensAfter === undefined ? '' : ` → 摘要 ${sized(result.tokensAfter)}`
-      tell($, `cache 过期前已自动压缩（${sized(before)} tokens${after}）。`)
-    })
-    .catch(() => {
-      // compact rejects while a turn runs; the cache epoch stays tried, the next message starts a new one
-    })
-    .finally(() => {
+      tell($, `${what}完成（${sized(before)} tokens${after}）。`, true)
       c.isCompacting = false
       void refresh($, c)
+    })
+    .catch((err: unknown) => {
+      if (/headless|not available/i.test(err instanceof Error ? err.message : String(err))) {
+        c.compactAsPrompt = true
+        asPrompt()
+        return
+      }
+      failed(err)
     })
 }
 
@@ -315,6 +384,11 @@ async function tick($: EngineInterface, c: Caffeine): Promise<void> {
   const now = await $.clock.now()
   if (c.armed && now >= c.armed.at) {
     await fire($, c, c.armed)
+  }
+  if (c.compactSent && now - c.compactSentAt > 15 * MINUTE) {
+    c.compactSent = false
+    c.isCompacting = false
+    tell($, '压缩提示 15 分钟内没有执行，已放弃这次。', true)
   }
   if (!c.isOn) {
     // keep-alive is off: past the size line, compact shortly before the cache expires
@@ -335,12 +409,12 @@ async function tick($: EngineInterface, c: Caffeine): Promise<void> {
   if (c.until && now >= c.until) {
     const wasWake = c.isWakeLit
     await switchOn($, c, false)
-    if (!wasWake) tell($, `保活到时间了，已关闭${handOver}。`)
+    if (!wasWake) tell($, `保活到时间了，已关闭${handOver}。`, true)
     return
   }
   if (!c.isForever && !c.armed && now - c.activeAt >= c.idle) {
     await switchOn($, c, false)
-    tell($, `${span(c.idle)} 内你没有发过新消息，保活已关闭${handOver}。`)
+    tell($, `${span(c.idle)} 内你没有发过新消息，保活已关闭${handOver}。`, true)
     return
   }
   if (c.poke !== 'none') {
@@ -583,6 +657,7 @@ const help = [
   '/caffeine 20 min check the build   a wake that tells Claude exactly that',
   '/caffeine wake prompt …  what Claude is told on every wake; wake prompt default goes back',
   '/caffeine wake auto     book the wake by itself whenever the limit hits (on/off)',
+  '/caffeine compact now  compact right now (to test it; the result or the failure reason shows as a notice)',
   '/caffeine compact on|off  keep-alive off + context past the size line: compact shortly before the cache expires (default on)',
   '/caffeine size 300k    the size line: below it, no automatic compaction (default 200k); keep-alive you turn on is not affected',
   '/caffeine status       what it is doing',
@@ -597,6 +672,7 @@ async function hold($: EngineInterface, c: Caffeine, by: string): Promise<void> 
 
 export const register: Register = (on, options) => {
   const bandOption = options?.band
+  if (options?.notify === 'normal' || options?.notify === 'quiet') notifyMode = options.notify
   const c: Caffeine = {
     isOn: false,
     until: 0,
@@ -636,6 +712,11 @@ export const register: Register = (on, options) => {
     dismissed: 0,
     isWakeLit: false,
     isCompacting: false,
+    compactAsPrompt: false,
+    compactSent: false,
+    compactSentAt: 0,
+    compactTurn: false,
+    compactManual: false,
     compactOn: true,
     size: DEFAULT_SIZE,
     compactTried: 0,
@@ -646,7 +727,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'caffeine',
       description: 'Keep the prompt cache warm while you step away, and wake Claude when the usage limit resets',
-      argumentHint: '[on|off|status|warm|until|wake|ttl|every|idle|auto|cost|poke|message|band|forever|help]',
+      argumentHint: '[on|off|status|warm|until|wake|ttl|every|idle|auto|cost|poke|message|band|compact|size|notify|log|forever|help]',
     })
     const started = await next(e)
     await load($, c)
@@ -746,7 +827,10 @@ export const register: Register = (on, options) => {
 
   on('turn.start', async ($, e, next) => {
     c.isBusy = true
-    if (c.poke === 'sent' && e.text.includes(c.message)) {
+    if (c.compactSent && !c.compactTurn) {
+      // caffeine's own /compact turn is no turn of yours: the keep-alive hold keeps running
+      c.compactTurn = true
+    } else if (c.poke === 'sent' && e.text.includes(c.message)) {
       c.poke = 'running'
       c.pokeTurnId = e.turnId
       c.isPokeExempt = false
@@ -759,6 +843,13 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
       c.isBusy = false
+      if (c.compactSent) {
+        c.compactSent = false
+        if (c.isCompacting) {
+          c.isCompacting = false
+          tell($, `${c.compactManual ? '手动' : '自动'}压缩没有执行（对话没有变短）。`, true)
+        }
+      }
       if (c.poke === 'running' && e.turnId === c.pokeTurnId) {
         c.poke = 'none'
         c.pokes += 1
@@ -777,6 +868,7 @@ export const register: Register = (on, options) => {
           tell(
             $,
             `turned off: its poke found the cache cold (rewrote ${sized(e.usage.cache_creation_input_tokens)} tokens), so pokes were not keeping it warm. /caffeine status may say why; turn it on again to retry.`,
+            true,
           )
         } else if (e.usage && !isExempt) {
           c.lastWarm = true
@@ -801,6 +893,13 @@ export const register: Register = (on, options) => {
     const done = await next(e)
     if (e.agentId === undefined && e.trigger !== 'precompute' && !('skip' in done && done.skip)) {
       await hold($, c, 'compaction')
+      if (c.isCompacting && c.compactSent) {
+        c.compacts += 1
+        c.isCompacting = false
+        c.compactSent = false
+        tell($, `${c.compactManual ? '手动' : 'cache 过期前自动'}压缩完成。`, true)
+        void refresh($, c)
+      }
     }
     return done
   })
@@ -865,6 +964,12 @@ export const register: Register = (on, options) => {
       }
       case 'compact': {
         const v = value.toLowerCase()
+        if (v === 'now') {
+          if (c.isCompacting) return { text: '正在压缩，稍等。' }
+          // a compaction started from inside this command would wait on the turn it holds
+          $.clock.after(50, () => void $.clock.now().then(t => compactNow($, c, t, true)))
+          return { text: '开始压缩，结果稍后以提示显示（成功或失败原因）。' }
+        }
         c.compactOn = v === 'on' ? true : v === 'off' ? false : !c.compactOn
         await $.store.set('compact', c.compactOn)
         await refresh($, c)
@@ -883,6 +988,26 @@ export const register: Register = (on, options) => {
         await $.store.set('size', n)
         await refresh($, c)
         return { text: `上下文到 ${sized(n)} 以上才自动压缩（现在 ${sized(c.context)}）。` }
+      }
+      case 'log': {
+        const v = value.toLowerCase()
+        if (v === 'clear') {
+          logBuf = []
+          await $.store.set('log', [])
+          return { text: '日志已清空。' }
+        }
+        const n = /^\d+$/.test(v) ? Number(v) : 30
+        return { text: logBuf.length ? logBuf.slice(-n).join('\n') : '日志是空的。' }
+      }
+      case 'notify': {
+        const v = value.toLowerCase()
+        if (v !== 'quiet' && v !== 'normal') {
+          return { text: `提示：${notifyMode}。/caffeine notify quiet（只弹失败、完成、保活结束）| normal（什么都弹）。所有事件都记在 /caffeine log 里。` }
+        }
+        notifyMode = v
+        await $.store.set('notify', v)
+        void $.config.set({ key: 'caffeine-compact.notify', value: v }).catch(() => undefined)
+        return { text: v === 'quiet' ? '提示：quiet，只弹失败、压缩完成、保活结束。' : '提示：normal，所有消息都弹。' }
       }
       case 'cost':
         return { text: costLines(c).join('\n') }
