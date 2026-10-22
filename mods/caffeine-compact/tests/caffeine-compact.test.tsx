@@ -109,6 +109,9 @@ const logs: string[] = []
 const compactCommands: string[] = []
 // when set, $.session.compact fails with this (a headless session has none)
 let compactError: string | null = null
+// what $.model.fork answers; null: nothing to fork
+let forkUsage: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number } | null = null
+let forks = 0
 
 // The engine beneath caffeine: the UI ops, the prompts it submits, the turns.
 function world(on: On, submitted: string[], crons: { cron: string; prompt: string }[] = [], pushed: string[] = []) {
@@ -146,6 +149,11 @@ function world(on: On, submitted: string[], crons: { cron: string; prompt: strin
   on('command.run', ($, e) => {
     if (e.command === 'compact') compactCommands.push(e.args)
     return { text: '' }
+  })
+  on('model.fork', () => {
+    forks += 1
+    if (!forkUsage) return { value: { isAnswered: false, reason: 'nothing-to-fork' } } as never
+    return { value: { isAnswered: true, text: '好', usage: forkUsage } } as never
   })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('session.compact', ($, e) => {
@@ -933,4 +941,32 @@ test('log keeps every event; notify quiet and normal report through /caffeine', 
   expect((await run($, 'notify quiet')).text).toContain('quiet')
   expect((await run($, 'log clear')).text).toContain('清空')
   expect((await run($, 'log')).text).toContain('空')
+})
+
+test('fork poke: reads the prefix without a message in the transcript; a cold read turns it off; nothing to fork falls back to a message', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  const submitted: string[] = []
+  world(on, submitted)
+  forks = 0
+  forkUsage = { input_tokens: 13, output_tokens: 3, cache_read_input_tokens: 200_000, cache_creation_input_tokens: 20 }
+  await $.session.start({ cwd: 'D:\work', surface: 'terminal', isInteractive: true })
+  await measure($, 250_000)
+  await turn($, 't1', 'work')
+  await run($, 'on')
+  await time.advance(56 * MIN)
+  expect(forks).toBe(1)
+  expect(submitted.length).toBe(0)
+  expect((await run($, 'log')).text).toContain('fork 保活')
+  // nothing to fork: a poke message goes out instead
+  forkUsage = null
+  await time.advance(56 * MIN)
+  expect(forks).toBe(2)
+  expect(submitted.length).toBe(1)
+  // mode prompt: no fork at all
+  expect((await run($, 'mode prompt')).text).toContain('prompt')
+  expect((await run($, 'mode')).text).toContain('prompt')
+  await run($, 'mode fork')
+  forkUsage = null
 })

@@ -165,6 +165,28 @@ function tell($: EngineInterface, text: string, isAlert = false): void {
   }
 }
 
+// One $.model.fork over the main thread's cached prefix; the usage says whether the cache still held it.
+async function forkProbe($: EngineInterface, c: Caffeine, label: string, since: string): Promise<boolean> {
+  try {
+    const r = await $.model.fork({ prompt: '只回一个字：好' })
+    const u = r.isAnswered || 'usage' in r ? r.usage : null
+    const usage = u ? `读缓存 ${sized(u.cache_read_input_tokens)}，写缓存 ${sized(u.cache_creation_input_tokens)}，未缓存输入 ${u.input_tokens}，输出 ${u.output_tokens}` : ''
+    const head = r.isAnswered ? `回复「${r.text.trim().slice(0, 20)}」` : `没有回复：${r.reason}`
+    tell($, `${label}（离上次请求 ${since}，上下文 ${sized(c.context)}）：${head}；${usage}`, true)
+    // part of the prefix (system prompt, tools) is shared with other sessions, so any read proves
+    // little: it counts as warm only when most of the input came from the cache
+    return !!u && u.cache_read_input_tokens >= 0.8 * (u.cache_read_input_tokens + u.cache_creation_input_tokens + u.input_tokens)
+  } catch (err) {
+    tell($, `${label}出错：${err instanceof Error ? err.message : String(err)}`, true)
+    return false
+  }
+}
+
+// forkexp: after the next reply, fork at 50 min (should refresh the entry) and at 65 min (hit only if it did)
+let expState: 'off' | 'armed' | 'running' = 'off'
+let expToken = 0
+let expControl = false
+
 async function setting<T>($: EngineInterface, key: string, fallback: T): Promise<T> {
   try {
     const value = await $.store.get(key)
@@ -181,6 +203,8 @@ async function load($: EngineInterface, c: Caffeine): Promise<void> {
   c.ttl = (await setting($, 'ttl', null)) as number | null
   c.autoAt = await setting($, 'autoAt', 0)
   c.compactOn = await setting($, 'compact', true)
+  const savedMode = await setting<string | null>($, 'pokeMode', null)
+  if (savedMode === 'fork' || savedMode === 'prompt') pokeMode = savedMode
   const savedNotify = await setting<string | null>($, 'notify', null)
   if (savedNotify === 'quiet' || savedNotify === 'normal') notifyMode = savedNotify
   logBuf = await setting<string[]>($, 'log', [])
@@ -307,14 +331,57 @@ async function switchOn($: EngineInterface, c: Caffeine, isOn: boolean, until = 
   await refresh($, c)
 }
 
-// Sends the poke: a prompt of its own, run once the session is idle.
-function poke($: EngineInterface, c: Caffeine, now: number): void {
+// Sends the poke. fork (default): one request over the main thread's cached prefix that never enters
+// the transcript, so the context does not grow. prompt: a message of its own, run once the session is idle.
+let pokeMode: 'fork' | 'prompt' = 'fork'
+
+function pokeByPrompt($: EngineInterface, c: Caffeine, now: number): void {
   c.poke = 'sent'
   c.sentAt = now
   record($, `保活 poke（上下文 ${sized(c.context)}）`)
   void $.prompt.submit({ text: c.message }).catch(() => {
     c.poke = 'none'
   })
+}
+
+function poke($: EngineInterface, c: Caffeine, now: number): void {
+  if (pokeMode === 'prompt') {
+    pokeByPrompt($, c, now)
+    return
+  }
+  c.poke = 'sent'
+  c.sentAt = now
+  void $.model
+    .fork({ prompt: '只回一个字：好' })
+    .then(async r => {
+      if (!r.isAnswered) {
+        // nothing to fork, an API error or an abort: no warm cache was proven, send a poke the old way
+        record($, `fork 保活没成（${r.reason}），改发 poke 消息`)
+        pokeByPrompt($, c, now)
+        return
+      }
+      const u = r.usage
+      const at = await $.clock.now()
+      c.poke = 'none'
+      c.pokes += 1
+      c.lastPoke = u
+      c.spent += equivalents(u, c.model, ttlOf(c))
+      const total = u.cache_read_input_tokens + u.cache_creation_input_tokens + u.input_tokens
+      if (u.cache_read_input_tokens >= 0.8 * total) {
+        c.lastWarm = true
+        c.lastAt = at
+        record($, `fork 保活（读缓存 ${sized(u.cache_read_input_tokens)}，写 ${sized(u.cache_creation_input_tokens)}）`)
+      } else {
+        c.lastWarm = false
+        await switchOn($, c, false)
+        tell($, `保活已关闭：fork 发现缓存已经冷了（读 ${sized(u.cache_read_input_tokens)}，要重新计费 ${sized(u.cache_creation_input_tokens + u.input_tokens)}），之前的保活没有守住它。`, true)
+      }
+      await refresh($, c)
+    })
+    .catch(() => {
+      record($, 'fork 保活出错，改发 poke 消息')
+      pokeByPrompt($, c, now)
+    })
 }
 
 const COMPACT_NOTE = (at: string, idleMin: number) =>
@@ -727,7 +794,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'caffeine',
       description: 'Keep the prompt cache warm while you step away, and wake Claude when the usage limit resets',
-      argumentHint: '[on|off|status|warm|until|wake|ttl|every|idle|auto|cost|poke|message|band|compact|size|notify|log|forever|help]',
+      argumentHint: '[on|off|status|warm|until|wake|ttl|every|idle|auto|cost|poke|message|band|compact|size|mode|notify|log|forever|help]',
     })
     const started = await next(e)
     await load($, c)
@@ -836,6 +903,11 @@ export const register: Register = (on, options) => {
       c.isPokeExempt = false
     } else {
       c.activeAt = await $.clock.now()
+      if (expState === 'running') {
+        expState = 'off'
+        expToken += 1
+        tell($, 'fork 实验被你的新消息打断，作废。重新 /caffeine forkexp。', true)
+      }
     }
     return next(e)
   })
@@ -843,6 +915,24 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
       c.isBusy = false
+      if (expState === 'armed' && c.poke === 'none' && !c.compactSent) {
+        expState = 'running'
+        const token = ++expToken
+        const group = expControl ? '对照' : '实验'
+        tell($, expControl ? 'fork 对照开始计时：中间不续命，65 分钟时 fork 一次。' : 'fork 实验开始计时：50 分钟后 fork 续命，65 分钟后再 fork 验证。')
+        if (!expControl) {
+          $.clock.after(50 * MINUTE, () => {
+            if (token === expToken) void forkProbe($, c, 'fork 实验 50 分钟（续命）', '50 分钟')
+          })
+        }
+        $.clock.after(65 * MINUTE, () => {
+          if (token !== expToken) return
+          void forkProbe($, c, `fork ${group} 65 分钟（验证）`, '65 分钟').then(hit => {
+            expState = 'off'
+            tell($, `${group}结果：65 分钟时缓存${hit ? '仍命中' : '已冷'}。`, true)
+          })
+        })
+      }
       if (c.compactSent) {
         c.compactSent = false
         if (c.isCompacting) {
@@ -999,6 +1089,15 @@ export const register: Register = (on, options) => {
         const n = /^\d+$/.test(v) ? Number(v) : 30
         return { text: logBuf.length ? logBuf.slice(-n).join('\n') : '日志是空的。' }
       }
+      case 'mode': {
+        const v = value.toLowerCase()
+        if (v !== 'fork' && v !== 'prompt') {
+          return { text: `保活方式：${pokeMode}。/caffeine mode fork（默认：后台读缓存续命，不进对话）| prompt（发一条 poke 消息，会留在对话里）` }
+        }
+        pokeMode = v
+        await $.store.set('pokeMode', v)
+        return { text: v === 'fork' ? '保活方式：fork，后台读缓存续命，对话里没有 poke 消息；fork 失败时自动改发 poke。' : '保活方式：prompt，每次发一条 poke 消息。' }
+      }
       case 'notify': {
         const v = value.toLowerCase()
         if (v !== 'quiet' && v !== 'normal') {
@@ -1008,6 +1107,23 @@ export const register: Register = (on, options) => {
         await $.store.set('notify', v)
         void $.config.set({ key: 'caffeine-compact.notify', value: v }).catch(() => undefined)
         return { text: v === 'quiet' ? '提示：quiet，只弹失败、压缩完成、保活结束。' : '提示：normal，所有消息都弹。' }
+      }
+      case 'forktest': {
+        // diagnostic: does $.model.fork read the main thread's cached prefix without touching the transcript?
+        $.clock.after(50, () => void forkProbe($, c, 'fork 测试', c.lastAt ? span(now - c.lastAt) : '（还没有请求）'))
+        return { text: 'fork 测试已发出，结果稍后以提示显示，也记在 /caffeine log。' }
+      }
+      case 'forkexp': {
+        if (value.toLowerCase() === 'cancel') {
+          expState = 'off'
+          expToken += 1
+          return { text: '实验已取消。' }
+        }
+        expControl = value.toLowerCase() === 'control'
+        if (c.isOn) return { text: '先 /caffeine off 关掉保活，否则 poke 会干扰实验。' }
+        expState = 'armed'
+        expToken += 1
+        return { text: (expControl ? '【对照组：中间不续命】' : '【实验组：50 分钟时续命】') + '已就位：你发下一条消息、Claude 回复完后开始计时。之后 65 分钟内不要再发消息（会中断实验），也不要关会话。结果会弹出并写进 /caffeine log。取消：/caffeine forkexp cancel。先跑 control，再跑不带参数的实验组。' }
       }
       case 'cost':
         return { text: costLines(c).join('\n') }

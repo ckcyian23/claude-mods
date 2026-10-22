@@ -44,6 +44,7 @@
 | `/caffeine warm 2h` / `until 18:00` | 按绝对时间保活，到点同样转入压缩 |
 | `/caffeine status` | 当前状态，含压缩计划和已压缩次数 |
 | `/caffeine log [n]` / `log clear` | 看最近 n 条（默认 30）事件日志 / 清空；日志存在插件的存储里，最多留 300 条，重启后还在 |
+| `/caffeine mode fork\|prompt` | 保活方式：`fork`（默认）在后台读主对话的缓存来续命，对话里没有 poke 消息，上下文不增长；`prompt` 发一条 poke 消息。fork 失败自动改发 poke |
 | `/caffeine notify quiet\|normal` | 弹窗多少：`quiet`（默认）只弹失败、压缩完成、保活结束；`normal` 全弹。不管哪种，所有事件都写进日志。也在 `/plugin` 配置菜单里 |
 
 其余命令（`on`、`off`、`every`、`ttl`、`wake` 等）见 `/caffeine help`。
