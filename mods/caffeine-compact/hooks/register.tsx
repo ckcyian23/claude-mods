@@ -115,6 +115,10 @@ type Caffeine = Brew & {
   wallSize: number
   compactTried: number
   compacts: number
+  // a resumed session's last reply, as the engine reported it before session.start; 0 for none
+  resumedAt: number
+  // session.start has run, so the saved state is read
+  isStarted: boolean
   // the wake
   armed: Armed | null
   // the last reply failed on the usage limit
@@ -775,6 +779,18 @@ const help = [
   '/caffeine forkexp [control|cancel]  1 小时对比实验：验证 fork 能不能续命（先 control，再不带参数；中途别发消息）',
 ].join('\n')
 
+// A resumed session (the process came back, or you reopened it) starts with no memory of its last
+// request. The engine says how long ago the last reply was; the cache stays warm for the rest of its
+// TTL. Claude Code sends that before session.start, so it waits in c.resumedAt until the saved state is read.
+async function adoptResume($: EngineInterface, c: Caffeine): Promise<void> {
+  if (!c.resumedAt || c.resumedAt <= c.lastAt) return
+  c.lastAt = c.resumedAt
+  c.resumedAt = 0
+  c.heldBy = ''
+  await keep($, c)
+  await refresh($, c)
+}
+
 async function hold($: EngineInterface, c: Caffeine, by: string): Promise<void> {
   c.lastAt = 0
   c.heldBy = by
@@ -834,7 +850,18 @@ export const register: Register = (on, options) => {
     wallSize: DEFAULT_WALL_SIZE,
     compactTried: 0,
     compacts: 0,
+    resumedAt: 0,
+    isStarted: false,
   }
+
+  on('classic.SessionStart', async ($, e, next) => {
+    const gap = e.seconds_since_last_response
+    if ((e.source === 'resume' || e.source === 'fork') && typeof gap === 'number' && e.prompt_cache_likely_expired !== true) {
+      c.resumedAt = (await $.clock.now()) - gap * 1000
+      if (c.isStarted) await adoptResume($, c)
+    }
+    return next(e)
+  })
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -856,6 +883,8 @@ export const register: Register = (on, options) => {
     } catch {
       // the first reply brings them
     }
+    c.isStarted = true
+    await adoptResume($, c)
     $.clock.after(50, () => void adopt($, c))
     $.clock.every(5_000, () => void tick($, c))
     // the countdowns

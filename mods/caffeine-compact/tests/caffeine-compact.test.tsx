@@ -138,6 +138,7 @@ function world(on: On, submitted: string[], crons: { cron: string; prompt: strin
   on('ui.focus', () => ({}))
   on('command.register', () => ({ value: undefined }) as never)
   on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('classic.SessionStart', () => ({}) as never)
   sessionCost = undefined
   stepCost = 0
   on('session.usage', () => ({ value: { rateLimits: [], context: { tokens: 250_000 }, ...(sessionCost === undefined ? {} : { cost: { usd: sessionCost } }) } }) as never)
@@ -220,6 +221,37 @@ test('on, it pokes 55 minutes after the last request on a 1h cache, and not on a
   expect((await run($, 'status')).text).toContain('cache went cold')
 
   expect((await run($, 'off')).text).toBe('Caffeine off.')
+})
+
+test('a resumed session takes its cache clock from the engine, not from nothing', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  const submitted: string[] = []
+  world(on, submitted)
+  // Claude Code sends SessionStart first, 20 minutes after the last reply, then session.start
+  await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 20 * 60, context_tokens: 250_000, prompt_cache_likely_expired: false } as never)
+  await $.session.start({ cwd: 'D:\\work', surface: 'terminal', isInteractive: true })
+  await run($, 'compact off')
+  await run($, 'on')
+  expect((await run($, 'status')).text).not.toContain('waits for the first reply')
+  // 55 minutes after the last reply, which was 20 minutes ago
+  await time.advance(34 * MIN)
+  expect(submitted).toEqual([])
+  await time.advance(2 * MIN)
+  expect(submitted).toEqual(['poke, just say okay'])
+})
+
+test('a resumed session whose cache is already gone, or a fresh one, starts with no clock', async ($, on) => {
+  mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  world(on, [])
+  await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 3 * 3600, context_tokens: 250_000, prompt_cache_likely_expired: true } as never)
+  await $.classic.SessionStart({ source: 'startup' } as never)
+  await $.session.start({ cwd: 'D:\\work', surface: 'terminal', isInteractive: true })
+  await run($, 'on')
+  expect((await run($, 'status')).text).toContain('waits for the first reply')
 })
 
 test('the band toggles it, edits the message, and draws what is beneath', { options: { band: 'on' } }, async ($, on) => {
