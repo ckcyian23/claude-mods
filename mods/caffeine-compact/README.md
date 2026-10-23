@@ -50,7 +50,7 @@
 | `/caffeine mode fork\|prompt` | 保活方式：`fork`（默认）在后台读主对话的缓存来续命，对话里没有 poke 消息，上下文不增长；`prompt` 发一条 poke 消息。fork 失败自动改发 poke |
 | `/caffeine notify quiet\|normal` | 弹窗多少：`quiet`（默认）只弹失败、压缩完成、保活结束；`normal` 全弹。不管哪种，所有事件都写进日志。也在 `/plugin` 配置菜单里 |
 
-其余命令（`on`、`off`、`every`、`ttl`、`wake` 等）见 `/caffeine help`。
+其余命令（`on`、`off`、`every`、`ttl`、`wake` 等）见 `/caffeine help`。help 按用途分组（离开前/回来后、自动压缩、保活怎么做、限额唤醒、状态和提示、诊断），全部是中文。
 
 ## 说明
 
