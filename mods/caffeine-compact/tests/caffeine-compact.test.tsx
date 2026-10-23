@@ -93,9 +93,9 @@ test('durations, times and the cadence', () => {
   expect(wasWarm({ cache_read_input_tokens: 90_000, cache_creation_input_tokens: 200 })).toBe(true)
   expect(wasWarm({ cache_read_input_tokens: 0, cache_creation_input_tokens: 90_000 })).toBe(false)
   expect(wasWarm(undefined)).toBeNull()
-  expect(overLine([{ kind: 'five_hour', percentUsed: 89 }])).toBeNull()
-  expect(overLine([{ kind: 'five_hour', percentUsed: 91.4 }])).toEqual({ label: '5h', percent: 91 })
-  expect(overLine([{ kind: 'seven_day', percentUsed: 95 }])?.label).toBe('weekly')
+  expect(overLine([{ kind: 'five_hour', percentUsed: 99 }])).toBeNull()
+  expect(overLine([{ kind: 'five_hour', percentUsed: 100 }])).toEqual({ label: '5h', percent: 100 })
+  expect(overLine([{ kind: 'seven_day', percentUsed: 100 }])?.label).toBe('weekly')
 })
 
 // The next request's usage, for the turn.step stand-in.
@@ -299,18 +299,25 @@ test('it wears off, turns itself off when idle, and pauses near the usage limit'
   expect((await run($, 'status')).text).toContain('until you turn it off (or 20m idle)')
   expect((await run($, 'status')).text).toContain('Off by itself after 20m idle')
 
-  // near the 5-hour line: paused, no pokes
+  // near the 5-hour limit the pokes go on; at 100% no request goes through: paused
   await run($, 'idle off yes')
   await run($, 'on')
   await turn($, 't3', 'more work')
-  await $.session.measure({
-    changed: ['rateLimits'],
-    context: { tokens: 1000, max: 200000, percent: 0.5 },
-    rateLimits: [{ kind: 'five_hour', percentUsed: 93, resetsAt: new Date(at(14, 0)).toISOString() }],
-  } as never)
-  await time.advance(4 * MIN)
+  const five = (percentUsed: number) =>
+    $.session.measure({
+      changed: ['rateLimits'],
+      context: { tokens: 1000, max: 200000, percent: 0.5 },
+      rateLimits: [{ kind: 'five_hour', percentUsed, resetsAt: new Date(at(14, 0)).toISOString() }],
+    } as never)
+  await five(100)
+  await time.advance(MIN)
   expect(submitted.length).toBe(sent)
-  expect((await run($, 'status')).text).toContain('paused · 5h limit 93%')
+  expect((await run($, 'status')).text).toContain('paused · 5h limit 100%')
+  await five(93)
+  await run($, 'every 10m')
+  await time.advance(11 * MIN)
+  expect(submitted.length).toBe(sent + 1)
+  expect((await run($, 'status')).text).not.toContain('paused')
 
   // a subscription (it has rate-limit windows) defaults to the 1h cache
   expect((await run($, 'status')).text).toContain('Cache TTL 1h (the subscription default)')
@@ -798,6 +805,61 @@ test('keep-alive off, past the size line: compacts shortly before the cache expi
   await turn($, 't4', 'work')
   await time.advance(55 * MIN)
   expect(compactions.length).toBe(1)
+})
+
+test('a usage wall ahead: past 95% with the reset beyond the cache, a big context compacts at once', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  const submitted: string[] = []
+  compactions.length = 0
+  world(on, submitted)
+  await $.session.start({ cwd: 'D:\work', surface: 'terminal', isInteractive: true })
+  const limits = (percent: number, resetInMin: number) => [{ kind: 'five_hour', percentUsed: percent, resetsAt: new Date(at(9, 0) + resetInMin * MIN).toISOString() }]
+  const measureWith = (tokens: number, rateLimits: object[]) =>
+    $.session.measure({ changed: ['context', 'rateLimits'], context: { tokens, max: 1_000_000, percent: 1 }, rateLimits } as never)
+
+  // the reset is 30 minutes away: the keep-alive/cache carries across, nothing to do
+  await measureWith(250_000, limits(96, 30))
+  await turn($, 't1', 'work')
+  await time.advance(10_000)
+  expect(compactions).toEqual([])
+
+  // the reset moves out past the cache's life: compact now, once
+  await measureWith(250_000, limits(96, 180))
+  await time.advance(10_000)
+  expect(compactions).toEqual(['plugin'])
+  await time.advance(10_000)
+  expect(compactions.length).toBe(1)
+
+  // under 95%, under the wall size, or at 100% (no request goes through): nothing
+  await turn($, 't2', 'work')
+  await measureWith(250_000, limits(94, 180))
+  await time.advance(10_000)
+  expect(compactions.length).toBe(1)
+  await measureWith(250_000, limits(100, 180))
+  await time.advance(10_000)
+  expect(compactions.length).toBe(1)
+  await measureWith(200_000, limits(96, 180))
+  await time.advance(10_000)
+  expect(compactions.length).toBe(1)
+
+  // the wall size is adjustable
+  expect((await run($, 'limitsize 150k')).text).toContain('150k')
+  await time.advance(10_000)
+  expect(compactions.length).toBe(2)
+  expect((await run($, 'limitsize 5')).text).toContain('Not a token count')
+  expect((await run($, 'limitsize default')).text).toContain('220k')
+
+  // the ordinary compaction no longer stops at 90%: only at 98%
+  await turn($, 't3', 'work')
+  await measureWith(210_000, limits(92, 180))
+  await time.advance(56 * MIN)
+  expect(compactions.length).toBe(3)
+  await turn($, 't4', 'work')
+  await measureWith(210_000, limits(98, 180))
+  await time.advance(56 * MIN)
+  expect(compactions.length).toBe(3)
 })
 
 test('keep-alive on: pokes for the hold, then turns off and compacts shortly before the cache expires', async ($, on) => {

@@ -31,16 +31,44 @@ export function compactAt(lastAt: number, ttl: number): number | null {
   return lastAt + ttl - Math.min(5 * minute, Math.round(ttl / 5))
 }
 
-// Pokes stop at these usage lines: the window is better spent on work.
-export const LIMIT_LINE = { five_hour: 90, seven_day: 95 } as const
+// Pokes stop only when a window is full: no request goes through then. Below it a poke costs
+// a twentieth of a cache rewrite, so they go on while the usage climbs.
+export const LIMIT_LINE = { five_hour: 100, seven_day: 100 } as const
 const LABELS: Record<string, string> = { five_hour: '5h', seven_day: 'weekly' }
 
-// The first window over its line, or null.
+// The first window at its line (full), or null.
 export function overLine(limits: readonly Limit[]): { label: string; percent: number } | null {
   for (const l of limits) {
     const line = LIMIT_LINE[l.kind as keyof typeof LIMIT_LINE]
     if (line !== undefined && l.percentUsed >= line) {
       return { label: LABELS[l.kind] ?? l.kind, percent: Math.round(l.percentUsed) }
+    }
+  }
+  return null
+}
+
+// Compaction is skipped only when a window is this full: the summary pass itself costs a few percent.
+export const COMPACT_STOP = 98
+
+export function nearlyFull(limits: readonly Limit[]): boolean {
+  return limits.some(l => l.kind in LIMIT_LINE && l.percentUsed >= COMPACT_STOP)
+}
+
+// A usage wall ahead: a window past this percent whose reset comes after the cache expires
+// (`cacheEnds`, the last request plus the TTL). The cache will die before work can resume, so a
+// big context is better shrunk while the cache is still warm (a rewrite costs 2x the context,
+// a compaction a fraction of it).
+export const WALL_PERCENT = 95
+export const DEFAULT_WALL_SIZE = 220_000
+
+// The window about to block, or null. Under 100%: at 100% no request goes through.
+export function wallAhead(limits: readonly Limit[], cacheEnds: number): { label: string; percent: number; resetsAt: number | null } | null {
+  for (const l of limits) {
+    if (!(l.kind in LIMIT_LINE) || l.percentUsed < WALL_PERCENT || l.percentUsed >= 100) continue
+    const reset = l.resetsAt ? Date.parse(l.resetsAt) : Number.NaN
+    const resetsAt = Number.isNaN(reset) ? null : reset
+    if (resetsAt === null || resetsAt > cacheEnds) {
+      return { label: LABELS[l.kind] ?? l.kind, percent: Math.round(l.percentUsed), resetsAt }
     }
   }
   return null
