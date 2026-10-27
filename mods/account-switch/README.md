@@ -64,13 +64,16 @@ claude plugin install account-switch@ckcyi-mods --scope user
 
 ## 添加新账号
 
-1. 运行 `login-new`：保存当前账号，清掉登录态，然后重启 Desktop，显示登录页。
+1. 面板里点「+ 添加账号…」，选「CLI + Desktop」「只加 Desktop」或「只加 CLI」（对应 `login-new [--only …]`）：保存当前账号，只清掉选中那边的登录态；涉及 Desktop 时重启 Desktop，显示登录页。另一边不动。
 2. 在 Desktop 里登录新账号；CLI 那边在终端运行 `claude`，再用 `/login` 登录。
-3. 运行 `save <新名字>`。如果只登录了其中一边，加上 `--only`。
+3. 运行 `save <新名字>`（面板里「保存当前账号…」）。CLI 和 Desktop 登录的不是同一个号时，存过的那边沿用原来的名字，新号用这次的名字；两边都是没存过的新号时，要分别加 `--only` 保存。
+
+**给已有的号补登另一边**：只存了一边的号，卡片上有「登录 Desktop」或「登录 CLI」按钮（就是 `login-new --only …`）。登录后脚本按账号 ID 认出它是同一个号，面板直接显示成这个号，下次切号时自动把这边的登录态补存进去，不用再手动 `save`。
 
 ## 原理（排查问题时看）
 
 - **CLI**：替换 `~/.claude/.credentials.json` 里的 `claudeAiOauth`，以及 `~/.claude.json` 里的 `oauthAccount`，其它设置不动。
+- **Desktop 的数据目录**：2026-10 起 Desktop 把数据从 `%APPDATA%\Claude` 搬到了 `%LOCALAPPDATA%\Claude-Data\<包名>`，旧目录只留一个 `.user-data-left.<包名>` 标记。脚本看到这个标记就改用新目录；改旧目录不会让 Desktop 登出或切号。也可以用环境变量 `CLAUDE_DESKTOP_USER_DATA_DIR` 直接指定。
 - **Desktop**：先退出 App，再替换 Cookies、Local Storage、IndexedDB 等登录相关的文件，以及 `config.json` 里的 `oauth:*` 和 `lastKnownAccountUuid`，然后重启。MCP 配置（`claude_desktop_config.json`）所有账号共用，不切换。
 - **切走之前先写回快照**：token 会轮换，所以切走前会把当前账号最新的登录态写回它自己的快照，否则旧快照会失效。
 - **怎么判断 CLI 当前是哪个号**：看凭证本身，不看 `~/.claude.json` 里的账号信息，因为 Desktop 托管的会话会把它改成 Desktop 的账号。依次这样判断：

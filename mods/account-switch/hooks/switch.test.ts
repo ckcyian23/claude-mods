@@ -40,7 +40,7 @@ function fakeScript(on: On, calls: string[][], opened: string[] = []) {
     calls.push([...args])
     const out = (exitCode: number, stdout: string) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (args[0] === 'status') return out(0, JSON.stringify(STATUS))
-    if (args[0] === 'use' && !args.includes('--yes') && !args.includes('cli')) {
+    if ((args[0] === 'use' || args[0] === 'login-new') && !args.includes('--yes') && !args.includes('cli')) {
       return out(3, '需要确认：这个操作要先退出 Claude Desktop。\n确认没问题后，加 --yes 重新运行。')
     }
     return out(0, `ok ${args.join(' ')}`)
@@ -106,6 +106,52 @@ test('卡片上点改名，输入新名字后运行 rename', async ($, on) => {
   await ui.input({ key: 'rename-b', text: 'work' })
   expect(calls.some(c => c.join(' ') === 'rename b work')).toBe(true)
   expect(await ui.find({ key: 'rename-b' })).toBeUndefined()
+})
+
+test('卡片上点删除，确认后才运行 remove；取消就什么都不做', async ($, on) => {
+  const calls: string[][] = []
+  fakeScript(on, calls)
+  await $.command.run(slash(''))
+  const ui = await $.ui.mount({ plugin: 'account-switch', surface: 'desktop', component: 'Pane', requestId: 'claude-switch', props: PANE })
+  await ui.press({ key: 'del-b' })
+  await ui.press({ key: 'remove-cancel-b' })
+  expect(calls.some(c => c[0] === 'remove')).toBe(false)
+  expect(await ui.find({ key: 'remove-box-b' })).toBeUndefined()
+  await ui.press({ key: 'del-b' })
+  await ui.press({ key: 'remove-confirm-b' })
+  expect(calls.some(c => c.join(' ') === 'remove b')).toBe(true)
+  expect(await ui.find({ key: 'remove-box-b' })).toBeUndefined()
+})
+
+test('只存了 CLI 的号，卡片上点「登录 Desktop」只清 Desktop，确认提醒显示在这张卡片里', async ($, on) => {
+  const calls: string[][] = []
+  fakeScript(on, calls)
+  STATUS.accounts.push({ name: 'd', hasCli: true, hasDesktop: false, email: 'd@example.com', plan: 'pro', usage: null })
+  try {
+    await $.command.run(slash(''))
+    const ui = await $.ui.mount({ plugin: 'account-switch', surface: 'desktop', component: 'Pane', requestId: 'claude-switch', props: PANE })
+    expect(await ui.find({ key: 'login-desk-b' })).toBeUndefined() // b 两边都存过
+    expect(await ui.find({ key: 'login-cli-d' })).toBeUndefined()
+    await ui.press({ key: 'login-desk-d' })
+    expect(calls.some(c => c.join(' ') === 'login-new --only desktop')).toBe(true)
+    await ui.press({ key: 'confirm' })
+    expect(calls.some(c => c.join(' ') === 'login-new --only desktop --yes')).toBe(true)
+  } finally {
+    STATUS.accounts.pop()
+  }
+})
+
+test('添加账号可以选只加一边', async ($, on) => {
+  const calls: string[][] = []
+  fakeScript(on, calls)
+  await $.command.run(slash(''))
+  const ui = await $.ui.mount({ plugin: 'account-switch', surface: 'desktop', component: 'Pane', requestId: 'claude-switch', props: PANE })
+  expect(await ui.find({ key: 'add-cli' })).toBeUndefined()
+  await ui.press({ key: 'login-new' })
+  await ui.press({ key: 'add-cli' })
+  expect(calls.some(c => c.join(' ') === 'login-new --only cli')).toBe(true)
+  expect(calls.some(c => c.join(' ') === 'login-new')).toBe(false)
+  expect(await ui.find({ key: 'add-cli' })).toBeUndefined()
 })
 
 test('Desktop 当前的号固定在第一、没有箭头；其余的号之间用箭头排序', async ($, on) => {

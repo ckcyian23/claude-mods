@@ -1,5 +1,6 @@
 // claude_switch.py status --json 的输出（只有账号名、邮箱、套餐、额度，没有 token）
-export type Side = { current: string | null; email: string | null; loggedIn: boolean; verified?: boolean }
+// current：这边登录的号存在哪个名字下（另一边存过也算）；saved：这边本身是否存过快照
+export type Side = { current: string | null; saved?: boolean; email: string | null; loggedIn: boolean; verified?: boolean }
 // 额度：fh = 5 小时窗口，sd = 本周窗口，百分比；Reset 是重置时间（秒），IsReset 表示已经到点恢复
 export type Usage = {
   at: number
@@ -38,6 +39,8 @@ declare module 'claude-code' {
       busy: boolean
       showSave: boolean
       renaming: string | null // 正在改名的账号
+      removing: string | null // 等确认删除的账号
+      showAdd: boolean // 展开「添加账号」的三个选项
     }
   }
 }

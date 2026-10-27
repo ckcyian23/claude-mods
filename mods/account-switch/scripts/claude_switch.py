@@ -177,6 +177,16 @@ def powershell(cmd, env=None):
     return r.returncode, r.stdout.decode("utf-8", "replace").strip()
 
 
+def to_recycle_bin(p):
+    """把目录移到回收站，不永久删除，删错了还能还原。"""
+    code, out = powershell(
+        "Add-Type -AssemblyName Microsoft.VisualBasic; "
+        "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($env:CCS_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')",
+        env=dict(os.environ, CCS_PATH=str(p)))
+    if p.exists():
+        die(f"没能移到回收站：{out or code}")
+
+
 def list_processes():
     """[(pid, 可执行文件完整路径)]，直接调用 Windows API，不启动任何外部程序。"""
     import ctypes
@@ -254,7 +264,7 @@ def set_order(names):
 
 def pinned_account():
     """Desktop 当前登录的账号，显示时固定在第一位。"""
-    return find_account("desktop", desktop_live_uuid())
+    return owner_name(desktop_live_uuid())
 
 
 def ordered_accounts():
@@ -284,6 +294,11 @@ def find_account(kind, uuid):
         if (m.get(kind) or {}).get("accountUuid") == uuid:
             return m["name"]
     return None
+
+
+def owner_name(uuid):
+    """这个账号存在哪个名字下：CLI、Desktop 任一边存过都算（补登另一边时靠它认出是同一个号）。"""
+    return find_account("desktop", uuid) or find_account("cli", uuid)
 
 
 def name_for_save(requested, uuid, email):
@@ -449,9 +464,9 @@ def cli_refresh_current():
     if not oauth:
         return None
     owner = cli_owner()
-    cur = find_account("cli", owner["accountUuid"]) if owner else None
+    cur = owner_name(owner["accountUuid"]) if owner else None
     if cur:
-        cli_save(cur)
+        cli_save(cur)  # 只存过 Desktop 的号补登了 CLI：在这里自动补存
     else:
         bk = BACKUPS / f"cli-{now_stamp()}"
         write_json(bk / "credentials.json", {"claudeAiOauth": oauth})
@@ -503,14 +518,20 @@ def desktop_dir():
     if env:
         return Path(env)
     appdata = Path(os.environ.get("APPDATA", HOME / "AppData" / "Roaming"))
-    p = appdata / "Claude"
-    if p.exists():
-        return Path(os.path.realpath(p))
     local = Path(os.environ.get("LOCALAPPDATA", HOME / "AppData" / "Local"))
-    for pkg in (local / "Packages").glob("Claude_*"):
-        q = pkg / "LocalCache" / "Roaming" / "Claude"
-        if q.exists():
-            return q
+    # 在 Desktop 里运行时 %APPDATA%\Claude 被 MSIX 重定向到包目录；WMI 启动的后台进程在包外，只能直接找包目录
+    cands = [appdata / "Claude"] + [pkg / "LocalCache" / "Roaming" / "Claude" for pkg in (local / "Packages").glob("Claude_*")]
+    for p in cands:
+        if not p.exists():
+            continue
+        p = Path(os.path.realpath(p))
+        # 2026-10 起 Desktop 把数据搬到 %LOCALAPPDATA%\Claude-Data\<包名>，旧目录只留下 .user-data-left.<包名> 标记。
+        # 旧目录里的登录态已经没人用了，改它不会让 Desktop 登出或切号。
+        for mark in p.glob(".user-data-left.*"):
+            q = local / "Claude-Data" / mark.name[len(".user-data-left."):]
+            if (q / "config.json").exists():
+                return q
+        return p
     die("找不到 Claude Desktop 的数据目录")
 
 
@@ -788,8 +809,9 @@ def prune_backups():
 
 
 def desktop_refresh_current():
-    """切走之前，把当前 Desktop 账号最新的登录态写回它自己的快照。"""
-    cur = find_account("desktop", desktop_live_uuid())
+    """切走之前，把当前 Desktop 账号最新的登录态写回它自己的快照。
+    只存过 CLI 的号补登了 Desktop，也在这里自动补存进同一个名字。"""
+    cur = owner_name(desktop_live_uuid())
     if cur:
         desktop_save(cur)
     elif desktop_live_uuid():
@@ -1057,10 +1079,11 @@ def status_data():
         })
     running = bool(desktop_processes())
     return {
-        "cli": {"current": find_account("cli", cli_uuid),
+        "cli": {"current": owner_name(cli_uuid), "saved": bool(find_account("cli", cli_uuid)),
                 "email": owner["email"] if owner else cli_acc.get("emailAddress"),
                 "loggedIn": bool(cli_live()[0]), "verified": bool(owner)},
-        "desktop": {"current": find_account("desktop", d_uuid), "email": desktop_email_for(d_uuid),
+        "desktop": {"current": owner_name(d_uuid), "saved": bool(find_account("desktop", d_uuid)),
+                    "email": desktop_email_for(d_uuid),
                     "loggedIn": bool(d_uuid), "running": running,
                     "activity": desktop_activity() if running else {"open": 0, "recent": []}},
         "job": read_json(JOB_FILE, None),
@@ -1074,7 +1097,9 @@ def who(side):
     if not side["loggedIn"]:
         return "未登录"
     email = side["email"] or "邮箱未知"
-    return f"{side['current']}（{email}）" if side["current"] else f"{email}（还没保存）"
+    if not side["current"]:
+        return f"{email}（还没保存）"
+    return f"{side['current']}（{email}）" + ("" if side.get("saved", True) else "，这边还没保存，下次切号时自动保存")
 
 
 def print_status(st):
@@ -1204,8 +1229,14 @@ def main():
         d = account_dir(a.name)
         if not d.exists():
             die(f"没有账号「{a.name}」")
-        shutil.rmtree(d)
-        log(f"已删除账号快照「{a.name}」")
+        to_recycle_bin(d)
+        usage = read_json(USAGE_FILE, {}) or {}
+        if usage.pop(a.name, None) is not None:
+            write_json(USAGE_FILE, usage)
+        order = (read_json(CONFIG_FILE, {}) or {}).get("order") or []
+        if a.name in order:
+            set_order([n for n in order if n != a.name])
+        log(f"已删除账号快照「{a.name}」（移到了回收站；只删快照，不会退出登录）")
     elif a.cmd == "_worker":
         time.sleep(a.delay)
         try:
@@ -1235,7 +1266,14 @@ def main():
             cli_uuid = (cli_owner() or {}).get("accountUuid") if cli_live()[0] else None
             d_uuid = desktop_live_uuid()
             if cli_uuid and d_uuid and cli_uuid != d_uuid:
-                die("CLI 和 Desktop 当前登录的不是同一个账号，请分别用 --only cli / --only desktop 保存")
+                # 两边不是同一个号：存过的那边沿用原来的名字，没存过的那边用这次给的名字
+                known = {side: owner_name(u) for side, u in (("cli", cli_uuid), ("desktop", d_uuid))}
+                new = [side for side, n in known.items() if not n]
+                if len(new) == 2:
+                    die("CLI 和 Desktop 登录的是两个都没存过的号，请分别用 --only cli / --only desktop 保存")
+                if new and name in known.values():
+                    die(f"「{name}」是另一边那个号的名字；{new[0].upper()} 这边是个新号，换个名字再保存")
+                log("CLI 和 Desktop 登录的不是同一个号，分别保存")
             if not cli_uuid:
                 log("CLI 未登录，跳过 CLI")
                 parts.remove("cli")

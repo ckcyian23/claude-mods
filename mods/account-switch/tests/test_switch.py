@@ -6,8 +6,9 @@ import os, tempfile, sys, json, shutil, importlib.util
 from pathlib import Path
 root = Path(tempfile.gettempdir()) / "claude-switch-test" / "sandbox"
 shutil.rmtree(root, ignore_errors=True)
-home = root / "home"; appdata = root / "appdata"
-os.environ.update(USERPROFILE=str(home), HOME=str(home), APPDATA=str(appdata))
+home = root / "home"; appdata = root / "appdata"; localappdata = root / "localappdata"
+os.environ.update(USERPROFILE=str(home), HOME=str(home), APPDATA=str(appdata), LOCALAPPDATA=str(localappdata))
+os.environ.pop("CLAUDE_DESKTOP_USER_DATA_DIR", None)
 os.environ.pop("CLAUDE_CONFIG_DIR", None)
 def w(p, d):
     p = Path(p); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(json.dumps(d), encoding="utf-8")
@@ -50,7 +51,7 @@ def check(cond, msg):
     print(("  ✔ " if cond else "  ✘ 失败：") + msg)
     if not cond: check.fail = True
 check.fail = False
-rd = lambda p: json.loads(Path(p).read_text())
+rd = lambda p: json.loads(Path(p).read_text(encoding="utf-8"))
 
 # 早期版本留下的 junction：同步时应换回真实目录（Desktop 拒绝往链接里写）
 legacy = home/".claude-switch/shared/claude-code-sessions"; w(legacy/"local_s0.json", {"t": "old-shared"})
@@ -134,4 +135,40 @@ run("rename", "副号", "__ckcyi")
 run("use", "副号", "--only", "cli")
 check(rd(home/".claude/.credentials.json")["claudeAiOauth"]["accessToken"] == "TOKB" and rd(dd/"config.json")["lastKnownAccountUuid"] == A, "改名后能用新名字切换；--only cli 只切 CLI，Desktop 不动")
 run("status")
+# 只存过 CLI 的号丙补登 Desktop：认出是同一个号，切走时自动把 Desktop 补存进「丙」
+C = "c" * 8 + "-3333-3333-3333-333333333333"
+login_cli(C, "c@x.com", "TOKC"); run("save", "丙", "--only", "cli")
+login_desktop(C, "DTOKC")
+st = m.status_data()
+check(st["desktop"]["current"] == "丙" and st["desktop"]["saved"] is False, "Desktop 登录了只存过 CLI 的号：认出是「丙」，标记为还没保存")
+run("use", "副号")
+check(m.load_meta("丙")["desktop"]["accountUuid"] == C and rd(home/".claude-switch/accounts/丙/desktop/config-auth.json")["oauth:tokenCache"] == "DTOKC",
+      "切走时把 Desktop 自动补存进「丙」")
+# CLI 和 Desktop 不是同一个号：存过的那边沿用原名，新号用这次的名字
+D = "d" * 8 + "-4444-4444-4444-444444444444"
+login_desktop(D, "DTOKD")
+run("save", "副号")
+check(m.load_meta("副号")["desktop"]["accountUuid"] == B, "（新号不能用另一边的名字）副号的 Desktop 没被覆盖")
+run("save", "丁")
+check(m.load_meta("丁")["desktop"]["accountUuid"] == D and "cli" not in m.load_meta("丁") and m.load_meta("副号")["cli"]["accountUuid"] == B,
+      "两边不同号时各存各的：Desktop 新号存为「丁」，CLI 沿用「副号」")
+run("remove", "丙"); run("remove", "丁")
+w(home/".claude-switch/accounts/乙/meta.json", {"name": "乙"}); m.set_order(["乙", "__ckcyi"])
+w(home/".claude-switch/usage.json", {**rd(home/".claude-switch/usage.json"), "乙": {"fh": 1}})
+run("remove", "乙")
+check(not (home/".claude-switch/accounts/乙").exists() and "乙" not in rd(home/".claude-switch/usage.json")
+      and "乙" not in rd(home/".claude-switch/config.json")["order"], "remove：快照移到回收站，额度和排序记录也清掉")
+# Desktop 把数据搬到 %LOCALAPPDATA%\Claude-Data\<包名>，旧目录留下标记：之后都要操作新目录
+moved = localappdata / "Claude-Data" / "claude_testpkg"
+shutil.copytree(dd, moved)
+(dd/".user-data-left.claude_testpkg").write_text("")
+check(m.desktop_dir() == moved, "Desktop 数据搬家后，找到新的数据目录")
+run("login-new", "--only", "desktop")
+check("oauth:tokenCache" not in rd(moved/"config.json") and not (moved/"Network").exists(), "login-new 清掉的是新目录里的登录态")
+check("oauth:tokenCache" in rd(dd/"config.json"), "旧目录不动")
+# 后台进程在 MSIX 包外：看不到 %APPDATA%\Claude，只能找到包目录，包目录里的搬家标记也要认
+pkgdir = localappdata / "Packages" / "Claude_testpkg" / "LocalCache" / "Roaming" / "Claude"
+pkgdir.parent.mkdir(parents=True); shutil.move(str(dd), str(pkgdir))
+check(m.desktop_dir() == moved, "在包外运行时，也能从包目录的标记找到新的数据目录")
+shutil.move(str(pkgdir), str(dd))
 print("\n最终：", "有失败" if check.fail else "全部通过")

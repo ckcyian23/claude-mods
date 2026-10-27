@@ -17,6 +17,8 @@ const message = atom({ plugin: 'account-switch', key: 'message' } as const, '')
 const busy = atom({ plugin: 'account-switch', key: 'busy' } as const, false)
 const showSave = atom({ plugin: 'account-switch', key: 'showSave' } as const, false)
 const renaming = atom({ plugin: 'account-switch', key: 'renaming' } as const, null)
+const removing = atom({ plugin: 'account-switch', key: 'removing' } as const, null)
+const showAdd = atom({ plugin: 'account-switch', key: 'showAdd' } as const, false)
 
 type Run = { code: number; out: string }
 type $ = EngineInterface
@@ -48,13 +50,13 @@ async function refresh($: $) {
 }
 
 // 执行一条命令；需要确认时记下来，等用户在面板里点确认
-async function act($: $, args: string[]): Promise<Run> {
+async function act($: $, args: string[], at?: string): Promise<Run> {
   await update($, busy, () => true)
   await update($, message, () => `正在执行：${args.join(' ')}…`)
   const r = await run($, args)
   if (r.code === NEEDS_CONFIRM) {
     // 提醒显示在点的按钮旁边：切某个号就在那张卡片里，其它操作在底部
-    const where = args[0] === 'use' && args[1] ? args[1] : 'footer'
+    const where = at ?? (args[0] === 'use' && args[1] ? args[1] : 'footer')
     const p: Pending = { args, where, text: r.out.replace(/\n?确认没问题后，加 --yes 重新运行。?/, '') }
     await update($, pending, () => p)
     await update($, message, () => '')
@@ -109,9 +111,9 @@ function refreshIfStale($: $, s: Status | null) {
   })
 }
 
-async function press($: $, args: string[]) {
+async function press($: $, args: string[], at?: string) {
   if (await read($, busy)) return
-  await act($, args)
+  await act($, args, at)
 }
 
 // ---------------------------------------------------------------- 显示用的小工具
@@ -181,8 +183,27 @@ function confirmBox($: $, ui: Ui, p: Pending) {
     <Box key="confirm-box" flexDirection="column" borderStyle="round" borderColor="warning" paddingX={1} marginTop={1}>
       <Text>{p.text}</Text>
       <Box columnGap={1} marginTop={1} flexWrap="wrap">
-        <Button key="confirm" variant="primary" label="确认退出并继续" onPress={() => press($, [...p.args, '--yes'])} />
+        <Button key="confirm" variant="primary" label="确认退出并继续" onPress={() => press($, [...p.args, '--yes'], p.where === 'footer' ? undefined : p.where)} />
         <Button key="dismiss" label="取消" onPress={() => update($, pending, () => null)} />
+      </Box>
+    </Box>
+  )
+}
+
+// 删除快照前在卡片里再确认一次
+function removeBox($: $, ui: Ui, name: string) {
+  const { Box, Text, Button } = ui
+  return (
+    <Box key={`remove-box-${name}`} flexDirection="column" borderStyle="round" borderColor="warning" paddingX={1} marginTop={1}>
+      <Text>{`删除「${name}」的账号快照？只删快照（移到回收站），不会退出登录。`}</Text>
+      <Box columnGap={1} marginTop={1} flexWrap="wrap">
+        <Button
+          key={`remove-confirm-${name}`}
+          variant="primary"
+          label="确认删除"
+          onPress={() => update($, removing, () => null).then(() => press($, ['remove', name]))}
+        />
+        <Button key={`remove-cancel-${name}`} label="取消" onPress={() => update($, removing, () => null)} />
       </Box>
     </Box>
   )
@@ -223,6 +244,7 @@ function cardTitle($: $, ui: Ui, a: Account, isCli: boolean, isDesk: boolean, is
       {Input && (
         <Button key={`ren-${a.name}`} plain dimColor label="改名" onPress={() => update($, renaming, () => a.name)} />
       )}
+      <Button key={`del-${a.name}`} plain dimColor label="删除" onPress={() => update($, removing, () => a.name)} />
       <Box flexGrow={1} />
       {isCli && <Text color="suggestion">CLI</Text>}
       {isDesk && <Text color="suggestion">Desktop</Text>}
@@ -232,7 +254,7 @@ function cardTitle($: $, ui: Ui, a: Account, isCli: boolean, isDesk: boolean, is
   )
 }
 
-function accountCard($: $, ui: Ui, s: Status, a: Account, p: Pending | null, isRenaming: boolean, isFirst: boolean, isLast: boolean) {
+function accountCard($: $, ui: Ui, s: Status, a: Account, p: Pending | null, isRenaming: boolean, isRemoving: boolean, isFirst: boolean, isLast: boolean) {
   const { Box, Text, Button } = ui
   const isCli = s.cli.current === a.name
   const isDesk = s.desktop.current === a.name
@@ -256,7 +278,9 @@ function accountCard($: $, ui: Ui, s: Status, a: Account, p: Pending | null, isR
       ) : (
         <Text dimColor>还没有额度记录</Text>
       )}
-      {p?.where === a.name ? (
+      {isRemoving ? (
+        removeBox($, ui, a.name)
+      ) : p?.where === a.name ? (
         confirmBox($, ui, p)
       ) : !(isCli && isDesk) && (
         <Box columnGap={2} marginTop={1} alignItems="center" flexWrap="wrap">
@@ -269,8 +293,16 @@ function accountCard($: $, ui: Ui, s: Status, a: Account, p: Pending | null, isR
           {a.hasDesktop && !isDesk && (
             <Button key={`desk-${a.name}`} plain dimColor label="只切 Desktop" onPress={() => press($, ['use', a.name, '--only', 'desktop'])} />
           )}
+          {!a.hasDesktop && !isDesk && (
+            <Button key={`login-desk-${a.name}`} plain label="登录 Desktop" onPress={() => press($, ['login-new', '--only', 'desktop'], a.name)} />
+          )}
+          {!a.hasCli && !isCli && (
+            <Button key={`login-cli-${a.name}`} plain label="登录 CLI" onPress={() => press($, ['login-new', '--only', 'cli'], a.name)} />
+          )}
         </Box>
       )}
+      {isDesk && s.desktop.saved === false && <Text dimColor size="footnote">Desktop 已登录这个号，下次切号时自动保存</Text>}
+      {isCli && s.cli.saved === false && <Text dimColor size="footnote">CLI 已登录这个号，下次切号时自动保存</Text>}
     </Box>
   )
 }
@@ -318,6 +350,8 @@ export const register: Register = on => {
     const isBusy = await read($, busy)
     const isSaveOpen = await read($, showSave)
     const editing = await read($, renaming)
+    const toRemove = await read($, removing)
+    const isAddOpen = await read($, showAdd)
     refreshIfStale($, s)
 
     if (!s) {
@@ -344,16 +378,31 @@ export const register: Register = on => {
         )}
 
         {accounts.map((a, i) =>
-          accountCard($, ui, s, a, p, editing === a.name, isPinned(a) || i <= first, isPinned(a) || i === last),
+          accountCard($, ui, s, a, p, editing === a.name, toRemove === a.name, isPinned(a) || i <= first, isPinned(a) || i === last),
         )}
 
         <Box columnGap={2} alignItems="center" flexWrap="wrap">
-          <Button key="login-new" plain label="+ 添加账号" onPress={() => press($, ['login-new'])} />
+          <Button key="login-new" plain label={isAddOpen ? '收起' : '+ 添加账号…'} onPress={() => update($, showAdd, v => !v)} />
           <Button key="sync" plain label={`⇄ ${sync}`} onPress={() => press($, ['sync-sessions'])} />
           {Input && (
             <Button key="toggle-save" plain label={isSaveOpen ? '收起' : '保存当前账号…'} onPress={() => update($, showSave, v => !v)} />
           )}
         </Box>
+
+        {isAddOpen && (
+          <Box columnGap={2} alignItems="center" flexWrap="wrap">
+            <Text dimColor>登录新账号：</Text>
+            {(
+              [
+                ['add-both', 'CLI + Desktop', []],
+                ['add-desktop', '只加 Desktop', ['--only', 'desktop']],
+                ['add-cli', '只加 CLI', ['--only', 'cli']],
+              ] as const
+            ).map(([key, label, only]) => (
+              <Button key={key} plain label={label} onPress={() => update($, showAdd, () => false).then(() => press($, ['login-new', ...only]))} />
+            ))}
+          </Box>
+        )}
 
         {p && !accounts.some(a => a.name === p.where) && confirmBox($, ui, p)}
 
