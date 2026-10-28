@@ -115,8 +115,27 @@ type Caffeine = Brew & {
   wallSize: number
   compactTried: number
   compacts: number
-  // a resumed session's last reply, as the engine reported it before session.start; 0 for none
-  resumedAt: number
+  // the TTL the last usage reading implied: kept when a later reading comes back empty (no network,
+  // logged out, a new process before its first reply), so a missing reading is not taken for a 5m cache.
+  // A 1h reading is also kept in the store, for the next process (an account switch restarts the app).
+  planTtl: number | null
+  // consecutive requests that found the cache cold inside the believed TTL; one can be an account
+  // switch or a prefix change, two say the TTL is shorter
+  coldStrikes: number
+  // the TTL last written to the log, to log only changes
+  loggedTtl: number
+  // the booked compaction was cancelled by hand; your next turn books again
+  isSkipped: boolean
+  // a resumed session's last reply as the engine reported it before session.start, and whether it
+  // called the cache expired; null for none
+  resume: { at: number; isExpired: boolean } | null
+  // a resumed conversation with no kept clock to say whether its cache is still there: keep-alive, once
+  // on, settles it with one fork; nothing compacts on it
+  isUnknown: boolean
+  // "<organization>:<account>" this process's credential signs in as, from the server; null unknown
+  identity: string | null
+  // the switch as last written to the store, to write only changes
+  keptBrew: string
   // session.start has run, so the saved state is read
   isStarted: boolean
   // the wake
@@ -135,7 +154,17 @@ const WARM = 60 * MINUTE
 
 // env and settings first (Claude Code reads them before picking by plan, so a cost that
 // contradicts them is a misread), then a 1h-priced request, then timing, then the plan
-const ttlOf = (c: Caffeine) => c.ttl ?? c.envTtl ?? c.measuredTtl ?? c.timedTtl ?? ttlByPlan(c.limits)
+const ttlOf = (c: Caffeine) => c.ttl ?? c.envTtl ?? c.measuredTtl ?? c.timedTtl ?? (c.limits.length ? ttlByPlan(c.limits) : (c.planTtl ?? ttlByPlan(c.limits)))
+
+// Takes a usage reading. An empty one (a failed request, a login being swapped, a process that has
+// not had its first reply) leaves the TTL the last good reading implied.
+function readLimits($: EngineInterface, c: Caffeine, limits: readonly Limit[]): void {
+  c.limits = [...limits]
+  if (!limits.length) return
+  const ttl = ttlByPlan(limits)
+  if (ttl === TTL_1H && c.planTtl !== TTL_1H) void Promise.resolve($.store.set('planTtl', ttl)).catch(() => undefined)
+  c.planTtl = ttl
+}
 
 // Where the TTL comes from, for /caffeine status.
 function ttlSource(c: Caffeine): string {
@@ -144,6 +173,7 @@ function ttlSource(c: Caffeine): string {
   if (c.measuredTtl !== null) return 'measured from what requests cost'
   if (c.timedTtl !== null) return 'measured from request timing'
   if (c.limits.length) return 'the subscription default'
+  if (c.planTtl !== null) return 'the subscription default, from the last usage reading'
   return c.lastAt ? 'the API-key default' : 'a guess until the first reply shows the plan'
 }
 const everyOf = (c: Caffeine) => c.every ?? defaultEvery(ttlOf(c))
@@ -153,7 +183,11 @@ const ttlLabel = (ms: number) => (ms >= TTL_1H ? '1h' : '5m')
 // ended, a finished compaction) toast in quiet mode; normal mode toasts everything.
 const LOG_MAX = 300
 let notifyMode: 'quiet' | 'normal' = 'quiet'
-let logBuf: string[] = []
+// The log is shared by every session: each line is appended to what the store holds now, one at a
+// time, so one session's write does not wipe another's lines.
+let logChain: Promise<void> = Promise.resolve()
+// the same for the other shared keys (clocks, brews): one read-modify-write at a time
+let storeChain: Promise<void> = Promise.resolve()
 
 function stamp(): string {
   const d = new Date()
@@ -162,9 +196,13 @@ function stamp(): string {
 }
 
 function record($: EngineInterface, text: string): void {
-  logBuf.push(`${stamp()} ${text}`)
-  if (logBuf.length > LOG_MAX) logBuf = logBuf.slice(-LOG_MAX)
-  void Promise.resolve($.store.set('log', logBuf)).catch(() => undefined)
+  const line = `${stamp()} ${text}`
+  logChain = logChain
+    .then(async () => {
+      const kept = await setting<string[]>($, 'log', [])
+      await $.store.set('log', [...kept, line].slice(-LOG_MAX))
+    })
+    .catch(() => undefined)
 }
 
 function tell($: EngineInterface, text: string, isAlert = false): void {
@@ -217,7 +255,7 @@ async function load($: EngineInterface, c: Caffeine): Promise<void> {
   if (savedMode === 'fork' || savedMode === 'prompt') pokeMode = savedMode
   const savedNotify = await setting<string | null>($, 'notify', null)
   if (savedNotify === 'quiet' || savedNotify === 'normal') notifyMode = savedNotify
-  logBuf = await setting<string[]>($, 'log', [])
+  c.planTtl = c.planTtl ?? ((await setting($, 'planTtl', null)) as number | null)
   c.size = (await setting($, 'size', DEFAULT_SIZE)) || DEFAULT_SIZE
   c.wallSize = (await setting($, 'wallSize', DEFAULT_WALL_SIZE)) || DEFAULT_WALL_SIZE
   // merged settings, as Claude Code reads them; a failed read leaves the key unset
@@ -239,9 +277,28 @@ async function load($: EngineInterface, c: Caffeine): Promise<void> {
   }
 }
 
+// The switch as the store keeps it per conversation, so it outlives the process (an account switch
+// restarts the app): on stays on, off stays off.
+type KeptBrew = { isOn: boolean; until: number; activeAt: number; isForever: boolean; isAutoDeclined: boolean; t: number }
+const DAY = 24 * 60 * 60_000
+
 async function keep($: EngineInterface, c: Caffeine): Promise<void> {
   const kept: Brew = { isOn: c.isOn, until: c.until, lastAt: c.lastAt, activeAt: c.activeAt, isAutoDeclined: c.isAutoDeclined, isForever: c.isForever }
   await update($, brew, () => kept).catch(() => undefined)
+  const saved = JSON.stringify([c.isOn, c.until, c.activeAt, c.isForever, c.isAutoDeclined])
+  if (saved === c.keptBrew) return
+  c.keptBrew = saved
+  const session = await sessionKey($)
+  const entry = { isOn: c.isOn, until: c.until, activeAt: c.activeAt, isForever: c.isForever, isAutoDeclined: c.isAutoDeclined }
+  storeChain = storeChain
+    .then(async () => {
+      const now = await $.clock.now()
+      const brews = { ...(await setting<Record<string, KeptBrew>>($, 'brews', {})) }
+      for (const [k, v] of Object.entries(brews)) if (now - v.t > 7 * DAY) delete brews[k]
+      brews[session] = { ...entry, t: now }
+      await $.store.set('brews', brews)
+    })
+    .catch(() => undefined)
 }
 
 // How long caffeine stays on: to a set time, or until turned off.
@@ -256,11 +313,29 @@ function howLong(c: Caffeine, now: number): string {
 function standby(c: Caffeine, now: number): string {
   if (!c.compactOn) return ''
   if (c.isCompacting) return ' · 正在压缩…'
+  if (c.isUnknown) return ' · 恢复的会话，不知道 cache 还剩多久：等你下次发消息再排压缩'
   if (c.lastAt === 0) return ' · 压缩待命'
   if (c.context < c.size) return ` · 压缩待命（上下文 ${sized(c.context)}，到 ${sized(c.size)} 才自动压缩）`
+  if (c.isSkipped) return ' · 已取消这次自动压缩（你下次发消息后恢复）'
   const at = compactAt(c.lastAt, ttlOf(c))!
   if (c.compactTried === c.lastAt || now >= c.lastAt + ttlOf(c)) return ' · cache 已过期，不压缩'
   return ` · ${clock(at, now)} 自动压缩（${span(Math.max(0, at - now))}后）`
+}
+
+// A compaction is booked and not yet run: what the band's cancel button and /caffeine compact skip stop.
+function compactPending(c: Caffeine, now: number): boolean {
+  return (
+    c.compactOn && !c.isOn && c.lastAt !== 0 && !c.isCompacting && c.context >= c.size &&
+    c.compactTried !== c.lastAt && !c.isSkipped && now < c.lastAt + ttlOf(c)
+  )
+}
+
+// Cancels the booked compaction, the usage-wall one too, until your next turn: a fork poke or a
+// resume moving lastAt does not undo it.
+async function skipCompact($: EngineInterface, c: Caffeine): Promise<void> {
+  c.isSkipped = true
+  record($, '手动取消了这次自动压缩')
+  await refresh($, c)
 }
 
 // One line for the band, the status line and /caffeine status.
@@ -277,7 +352,11 @@ function describe(c: Caffeine, now: number): { text: string; color?: string; isD
     return { text: `caffeine paused · ${over.label} limit ${over.percent}%${tail}`, color: 'yellow' }
   }
   if (c.lastAt === 0) {
-    const why = c.heldBy ? `waits for your next message after the ${c.heldBy}` : 'waits for the first reply'
+    const why = c.heldBy
+      ? `waits for your next message after the ${c.heldBy}`
+      : c.isUnknown
+        ? 'checking whether the cache is still warm'
+        : 'waits for the first reply'
     return { text: `caffeine on · ${why}${tail}`, color: 'green' }
   }
   if (c.isBusy || c.poke !== 'none') {
@@ -312,13 +391,19 @@ function cacheLeft(c: Caffeine, now: number): { text: string; color: string } | 
 function showBand(c: Caffeine, now: number): boolean {
   if (c.band !== 'auto') return c.band === 'on'
   if (c.isOn || c.isCompacting || c.isEditing) return true
-  if (!c.compactOn || c.lastAt === 0 || c.context < c.size || c.compactTried === c.lastAt) return false
+  if (!c.compactOn || c.lastAt === 0 || c.context < c.size || c.compactTried === c.lastAt || c.isSkipped) return false
   const at = compactAt(c.lastAt, ttlOf(c))!
   return now >= at - 10 * MINUTE && now < c.lastAt + ttlOf(c)
 }
 
 async function refresh($: EngineInterface, c: Caffeine): Promise<void> {
   const now = await $.clock.now()
+  // every change of the TTL the plugin works from goes in the log, with where it came from
+  const ttl = ttlOf(c)
+  if (ttl !== c.loggedTtl) {
+    if (c.loggedTtl !== 0) record($, `cache TTL 改按 ${ttlLabel(ttl)} 算（${ttlSource(c)}；用量读数 ${c.limits.length ? '有' : '空'}）`)
+    c.loggedTtl = ttl
+  }
   if (showBand(c, now) || !c.isOn) {
     $.ui.status(undefined)
   } else {
@@ -381,6 +466,7 @@ function poke($: EngineInterface, c: Caffeine, now: number): void {
       if (u.cache_read_input_tokens >= 0.8 * total) {
         c.lastWarm = true
         c.lastAt = at
+        void stampClock($, c, at)
         record($, `fork 保活（读缓存 ${sized(u.cache_read_input_tokens)}，写 ${sized(u.cache_creation_input_tokens)}）`)
       } else {
         c.lastWarm = false
@@ -392,6 +478,48 @@ function poke($: EngineInterface, c: Caffeine, now: number): void {
     .catch(() => {
       record($, 'fork 保活出错，改发 poke 消息')
       pokeByPrompt($, c, now)
+    })
+}
+
+// A resumed conversation with no kept clock, keep-alive on: one fork tells whether the cache is still
+// there. Warm, that was a cheap read; cold, it wrote the cache again, as your next message would
+// have, and the keep-alive goes on from here instead of turning off.
+function probeCache($: EngineInterface, c: Caffeine, now: number): void {
+  c.isUnknown = false
+  c.poke = 'sent'
+  c.sentAt = now
+  void $.model
+    .fork({ prompt: '只回一个字：好' })
+    .then(async r => {
+      c.poke = 'none'
+      if (!r.isAnswered) {
+        record($, `确认 cache 的 fork 没成（${r.reason}），等你下一条消息`)
+        await refresh($, c)
+        return
+      }
+      const u = r.usage
+      const at = await $.clock.now()
+      const model = c.model || (await sessionModel($))
+      c.pokes += 1
+      c.lastPoke = u
+      c.spent += equivalents(u, model, ttlOf(c))
+      const total = u.cache_read_input_tokens + u.cache_creation_input_tokens + u.input_tokens
+      c.lastWarm = u.cache_read_input_tokens >= 0.8 * total
+      c.lastAt = at
+      c.heldBy = ''
+      void stampClock($, c, at)
+      record(
+        $,
+        c.lastWarm
+          ? `确认 cache：还热（读缓存 ${sized(u.cache_read_input_tokens)}），保活接着进行`
+          : `确认 cache：已经冷了，这次重新写入 ${sized(u.cache_creation_input_tokens + u.input_tokens)}，保活从现在接着进行`,
+      )
+      await keep($, c)
+      await refresh($, c)
+    })
+    .catch(() => {
+      c.poke = 'none'
+      record($, '确认 cache 的 fork 出错，等你下一条消息')
     })
 }
 
@@ -483,7 +611,7 @@ async function tick($: EngineInterface, c: Caffeine): Promise<void> {
   const wall = wallAhead(c.limits, c.lastAt + ttlOf(c))
   if (
     wall && c.compactOn && c.lastAt !== 0 && now < c.lastAt + ttlOf(c) && c.context >= c.wallSize &&
-    c.compactTried !== c.lastAt && !c.isCompacting && !c.isBusy && c.poke === 'none'
+    c.compactTried !== c.lastAt && !c.isSkipped && !c.isCompacting && !c.isBusy && c.poke === 'none'
   ) {
     compactNow($, c, now, false, wallText(wall, now))
     return
@@ -494,7 +622,7 @@ async function tick($: EngineInterface, c: Caffeine): Promise<void> {
     const at = compactAt(c.lastAt, ttl)
     if (
       c.compactOn && at !== null && now >= at && now < c.lastAt + ttl &&
-      c.compactTried !== c.lastAt && !c.isCompacting && !c.isBusy && c.poke === 'none' && !c.armed &&
+      c.compactTried !== c.lastAt && !c.isSkipped && !c.isCompacting && !c.isBusy && c.poke === 'none' && !c.armed &&
       c.context >= c.size && !nearlyFull(c.limits)
     ) {
       compactNow($, c, now)
@@ -513,6 +641,11 @@ async function tick($: EngineInterface, c: Caffeine): Promise<void> {
   if (!c.isForever && !c.armed && now - c.activeAt >= c.idle) {
     await switchOn($, c, false)
     tell($, `${span(c.idle)} 内你没有发过新消息，保活已关闭${handOver}。`, true)
+    return
+  }
+  // keep-alive is on and nobody knows whether the cache is still there: one fork settles it
+  if (c.isUnknown && c.poke === 'none' && !c.isBusy && !c.isCompacting && !overLine(c.limits)) {
+    probeCache($, c, now)
     return
   }
   if (c.poke !== 'none') {
@@ -750,6 +883,7 @@ const help = [
   '【自动压缩】',
   '/caffeine compact on|off  自动压缩开关（默认开）',
   '/caffeine compact now     立刻压缩一次，用来测试；结果或失败原因以提示显示',
+  '/caffeine compact skip    取消排好的这一次自动压缩（输入框上方的 skip compact 按钮，快捷键 x，同效）；下一条消息后恢复',
   '/caffeine size 180k       大小线：没开保活时，上下文到这个值以上才会在 cache 过期前（最后一次请求后 55 分钟）压缩（default 恢复 200k）',
   '/caffeine limitsize 220k  限额前提前压缩的大小线：5h 或周用量到 95% 且重置晚于 cache 过期时，上下文到这个值以上就立刻压缩（default 恢复 220k）',
   '',
@@ -779,14 +913,118 @@ const help = [
   '/caffeine forkexp [control|cancel]  1 小时对比实验：验证 fork 能不能续命（先 control，再不带参数；中途别发消息）',
 ].join('\n')
 
-// A resumed session (the process came back, or you reopened it) starts with no memory of its last
-// request. The engine says how long ago the last reply was; the cache stays warm for the rest of its
-// TTL. Claude Code sends that before session.start, so it waits in c.resumedAt until the saved state is read.
-async function adoptResume($: EngineInterface, c: Caffeine): Promise<void> {
-  if (!c.resumedAt || c.resumedAt <= c.lastAt) return
-  c.lastAt = c.resumedAt
-  c.resumedAt = 0
-  c.heldBy = ''
+// The cache is per organization, account and model, and the engine's "seconds since the last reply"
+// knows none of them: after an account switch it describes a cache this account never had. So every
+// request that lands (and every fork that finds the cache warm) is kept as
+// clocks["<organization>:<account>|<conversation>|<model>"], and a resumed process trusts those.
+// `at` is the request, 0 for a cache emptied by a compaction or /clear; `t` is when it was written.
+type Clock = { at: number; t: number }
+const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
+const clockKey = (identity: string, session: string, model: string) => `${identity}|${session}|${model}`
+const clockSession = (key: string) => key.split('|')[1]
+
+async function sessionModel($: EngineInterface): Promise<string> {
+  try {
+    return (await $.session.model()) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+// One read-modify-write of the clocks at a time; entries older than a day go (the TTL is an hour at most).
+function editClocks($: EngineInterface, edit: (clocks: Record<string, Clock>, now: number) => void): Promise<void> {
+  storeChain = storeChain
+    .then(async () => {
+      const now = await $.clock.now()
+      const clocks = { ...(await setting<Record<string, Clock>>($, 'clocks', {})) }
+      for (const [k, v] of Object.entries(clocks)) if (now - v.t > DAY) delete clocks[k]
+      edit(clocks, now)
+      await $.store.set('clocks', clocks)
+    })
+    .catch(() => undefined)
+  return storeChain
+}
+
+// A request that landed, or a fork that found the cache warm, on this account and model.
+async function stampClock($: EngineInterface, c: Caffeine, at: number): Promise<void> {
+  if (!c.identity) return
+  const key = clockKey(c.identity, await sessionKey($), await sessionModel($))
+  await editClocks($, (clocks, now) => {
+    clocks[key] = { at, t: now }
+  })
+}
+
+// A compaction or /clear: every cache the conversation had is useless. One mark at 0 says so, so a
+// resume knows the cache is gone instead of not knowing.
+async function dropClocks($: EngineInterface, c: Caffeine): Promise<void> {
+  const session = await sessionKey($)
+  const key = clockKey(c.identity ?? '?', session, await sessionModel($))
+  await editClocks($, (clocks, now) => {
+    for (const k of Object.keys(clocks)) if (clockSession(k) === session) delete clocks[k]
+    clocks[key] = { at: 0, t: now }
+  })
+}
+
+// The account this process's own credential signs in as, asked of the server with that credential
+// (the plugin never sees it): Desktop and the CLI can hold different accounts, and /login changes it.
+// A network failure keeps what was known; no login, an API key or a refusal is null.
+async function whoAmI($: EngineInterface, c: Caffeine): Promise<string | null> {
+  let identity: string | null = null
+  try {
+    const auth = await $.session.authorize()
+    if (auth) {
+      const res = await $.http.fetch(PROFILE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
+      if (res.status >= 500) return c.identity
+      if (res.ok) {
+        const body = JSON.parse(res.text) as { account?: { uuid?: string }; organization?: { uuid?: string } }
+        const org = body.organization?.uuid
+        const account = body.account?.uuid
+        if (org && account) identity = `${org}:${account}`
+      }
+    }
+  } catch {
+    return c.identity
+  }
+  if (identity && identity !== c.identity) {
+    const [org = '', account = ''] = identity.split(':')
+    record($, `账号：组织 ${org.slice(0, 8)}…，账号 ${account.slice(0, 8)}…`)
+  }
+  c.identity = identity
+  return identity
+}
+
+// A resumed session (the process came back, the app restarted for an account switch, you reopened it)
+// starts with no memory of its last request. Claude Code sends the engine's word before session.start,
+// so it waits in c.resume until the saved state is read. Then:
+// - this account's kept clock for this conversation and model is the cache's time;
+// - the engine's reply time counts too when the last request kept was this account on this model;
+// - a conversation kept under another account or model only: its cache here is cold;
+// - nothing kept at all, or no account to look it up by: not known (c.isUnknown).
+// The engine's gap is in whole seconds, so the same reply reported again lands a little off: within a
+// few seconds of lastAt it is the reply already known, and lastAt stays.
+const RESUME_SLACK = 5_000
+async function resolveClock($: EngineInterface, c: Caffeine): Promise<void> {
+  const resume = c.resume
+  c.resume = null
+  if (!resume) return
+  const identity = await whoAmI($, c)
+  const session = await sessionKey($)
+  const clocks = await setting<Record<string, Clock>>($, 'clocks', {})
+  let latest = ''
+  for (const [k, v] of Object.entries(clocks)) {
+    if (clockSession(k) === session && (!latest || v.t > (clocks[latest]?.t ?? 0))) latest = k
+  }
+  const mine = identity ? clockKey(identity, session, await sessionModel($)) : ''
+  let at = (mine && clocks[mine]?.at) || 0
+  // a mark at 0 is a compaction after that reply: its cache is gone whatever the engine says
+  if (mine && latest === mine && clocks[mine]?.at !== 0 && !resume.isExpired) at = Math.max(at, resume.at)
+  if (at > c.lastAt + RESUME_SLACK) {
+    c.lastAt = at
+    c.heldBy = ''
+    c.isUnknown = false
+  } else if (c.lastAt === 0) {
+    c.isUnknown = !resume.isExpired && (!identity || !latest)
+  }
   await keep($, c)
   await refresh($, c)
 }
@@ -794,6 +1032,8 @@ async function adoptResume($: EngineInterface, c: Caffeine): Promise<void> {
 async function hold($: EngineInterface, c: Caffeine, by: string): Promise<void> {
   c.lastAt = 0
   c.heldBy = by
+  c.isUnknown = false
+  void dropClocks($, c)
   await keep($, c)
   await refresh($, c)
 }
@@ -850,15 +1090,22 @@ export const register: Register = (on, options) => {
     wallSize: DEFAULT_WALL_SIZE,
     compactTried: 0,
     compacts: 0,
-    resumedAt: 0,
+    planTtl: null,
+    coldStrikes: 0,
+    loggedTtl: 0,
+    isSkipped: false,
+    resume: null,
+    isUnknown: false,
+    identity: null,
+    keptBrew: '',
     isStarted: false,
   }
 
   on('classic.SessionStart', async ($, e, next) => {
     const gap = e.seconds_since_last_response
-    if ((e.source === 'resume' || e.source === 'fork') && typeof gap === 'number' && e.prompt_cache_likely_expired !== true) {
-      c.resumedAt = (await $.clock.now()) - gap * 1000
-      if (c.isStarted) await adoptResume($, c)
+    if ((e.source === 'resume' || e.source === 'fork') && typeof gap === 'number') {
+      c.resume = { at: (await $.clock.now()) - gap * 1000, isExpired: e.prompt_cache_likely_expired === true }
+      if (c.isStarted) await resolveClock($, c)
     }
     return next(e)
   })
@@ -871,20 +1118,37 @@ export const register: Register = (on, options) => {
     })
     const started = await next(e)
     await load($, c)
+    let isReload = false
     try {
-      Object.assign(c, await read($, brew))
+      const state = await read($, brew)
+      // a reload of the mod: the host kept the session's state
+      isReload = state.isOn || state.lastAt !== 0 || state.activeAt !== 0
+      Object.assign(c, state)
     } catch {
       // a fresh session: off
     }
+    if (!isReload) {
+      // a new process: the switch as this conversation left it
+      const kept = (await setting<Record<string, KeptBrew>>($, 'brews', {}))[await sessionKey($)]
+      if (kept) {
+        c.isOn = kept.isOn
+        c.until = kept.until
+        c.activeAt = kept.activeAt
+        c.isForever = kept.isForever
+        c.isAutoDeclined = kept.isAutoDeclined
+        c.keptBrew = JSON.stringify([c.isOn, c.until, c.activeAt, c.isForever, c.isAutoDeclined])
+      }
+    }
     try {
       const usage = await $.session.usage()
-      c.limits = [...usage.rateLimits]
+      readLimits($, c, usage.rateLimits)
       c.context = usage.context?.tokens ?? c.context
     } catch {
       // the first reply brings them
     }
     c.isStarted = true
-    await adoptResume($, c)
+    if (c.resume) await resolveClock($, c)
+    else void whoAmI($, c)
     $.clock.after(50, () => void adopt($, c))
     $.clock.every(5_000, () => void tick($, c))
     // the countdowns
@@ -897,7 +1161,7 @@ export const register: Register = (on, options) => {
 
   on('session.measure', async ($, e, next) => {
     const wasNear = isNear(c.limits)
-    c.limits = [...e.rateLimits]
+    readLimits($, c, e.rateLimits)
     c.context = e.context?.tokens ?? c.context
     if (c.autoAt && !c.isOn && !c.isAutoDeclined && c.context >= c.autoAt) {
       await switchOn($, c, true)
@@ -940,24 +1204,35 @@ export const register: Register = (on, options) => {
     const isExempt = c.lastAt === 0 || (c.model !== '' && c.model !== e.model)
     if (isExempt && c.poke === 'running') c.isPokeExempt = true
     c.model = e.model
-    c.lastAt = at
-    c.heldBy = ''
-    void keep($, c)
     const before = await costNow($)
     const result = yield* next(e)
     const after = await costNow($)
+    // only a request that got a response restarted the cache's TTL; a failed one (no network, no
+    // login) never reached it
+    if (result.stopReason !== null) {
+      c.lastAt = at
+      c.isUnknown = false
+      c.heldBy = ''
+      void keep($, c)
+      void stampClock($, c, at)
+    }
     if (result.usage) {
       const priced = before !== null && after !== null ? ttlFromCost(after - before, result.usage, result.usage.model || e.model) : null
       c.isPriced = priced !== null
       if (priced !== null) c.measuredTtl = priced
       const timing = readTiming(gap, result.usage, isExempt)
       // a rewrite priced at 1h was no expiry, so it says nothing about a 5m TTL
-      if (timing.ttl !== null && !(timing.isCold && priced !== null)) c.timedTtl = timing.ttl
+      if (timing.ttl === TTL_1H) c.coldStrikes = 0
+      // One cold request inside the hour is not yet a 5m cache: it is as likely an account switch (the
+      // cache is per account), an MCP reconnect or a tool list change. The second in a row is.
+      if (timing.isCold && priced === null) c.coldStrikes += 1
+      const isShort = timing.isCold && c.coldStrikes < 2
+      if (timing.ttl !== null && !(timing.isCold && priced !== null) && !isShort) c.timedTtl = timing.ttl
       if (timing.isCold) {
         c.coldAt = at
         c.coldGap = gap
-        // cold inside the believed TTL with no 1h reading of its own: an earlier 1h reading was wrong
-        if (gap < believed && priced === null) c.measuredTtl = null
+        // cold inside the believed TTL twice with no 1h reading of its own: an earlier 1h reading was wrong
+        if (gap < believed && priced === null && !isShort) c.measuredTtl = null
         if (c.isOn && c.poke !== 'running') {
           tell($, `the cache had gone cold after ${span(gap)} idle; this request wrote it again.`)
         }
@@ -978,6 +1253,9 @@ export const register: Register = (on, options) => {
       c.isPokeExempt = false
     } else {
       c.activeAt = await $.clock.now()
+      c.isSkipped = false
+      // the account can change under a running session (/login): asked again on each turn of yours
+      void whoAmI($, c)
       if (expState === 'running') {
         expState = 'off'
         expToken += 1
@@ -1135,6 +1413,11 @@ export const register: Register = (on, options) => {
           $.clock.after(50, () => void $.clock.now().then(t => compactNow($, c, t, true)))
           return { text: '开始压缩，结果稍后以提示显示（成功或失败原因）。' }
         }
+        if (v === 'skip') {
+          if (!compactPending(c, now)) return { text: '现在没有排好的自动压缩可取消。' }
+          await skipCompact($, c)
+          return { text: '已取消这次自动压缩。你发下一条消息后，会按新的 cache 重新排。' }
+        }
         c.compactOn = v === 'on' ? true : v === 'off' ? false : !c.compactOn
         await $.store.set('compact', c.compactOn)
         await refresh($, c)
@@ -1166,13 +1449,15 @@ export const register: Register = (on, options) => {
       }
       case 'log': {
         const v = value.toLowerCase()
+        // lines still being appended land first
+        await logChain
         if (v === 'clear') {
-          logBuf = []
           await $.store.set('log', [])
           return { text: '日志已清空。' }
         }
         const n = /^\d+$/.test(v) ? Number(v) : 30
-        return { text: logBuf.length ? logBuf.slice(-n).join('\n') : '日志是空的。' }
+        const kept = await setting<string[]>($, 'log', [])
+        return { text: kept.length ? kept.slice(-n).join('\n') : '日志是空的。' }
       }
       case 'mode': {
         const v = value.toLowerCase()
@@ -1385,6 +1670,11 @@ export const register: Register = (on, options) => {
           >
             {c.isOn ? 'turn off' : 'turn on'}
           </Button>
+          {compactPending(c, now) ? (
+            <Button key="caffeine-skip" plain hotkey="x" onPress={() => void skipCompact($, c)}>
+              skip compact
+            </Button>
+          ) : null}
           <Button key="caffeine-edit" plain dimColor hotkey="e" onPress={() => void editInBand($, c)}>
             message
           </Button>

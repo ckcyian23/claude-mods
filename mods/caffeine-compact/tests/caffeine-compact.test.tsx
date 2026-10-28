@@ -112,6 +112,12 @@ let compactError: string | null = null
 // what $.model.fork answers; null: nothing to fork
 let forkUsage: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number } | null = null
 let forks = 0
+// the account the session's credential signs in as; null: none (an API key, logged out)
+const ME = { organization: { uuid: 'org-me' }, account: { uuid: 'acct-me' } }
+const OTHER = { organization: { uuid: 'org-other' }, account: { uuid: 'acct-other' } }
+let profile: typeof ME | null = ME
+// why the next request stopped; null: no response came (a failed request)
+let stepStop: string | null = 'end_turn'
 
 // The engine beneath caffeine: the UI ops, the prompts it submits, the turns.
 function world(on: On, submitted: string[], crons: { cron: string; prompt: string }[] = [], pushed: string[] = []) {
@@ -139,6 +145,13 @@ function world(on: On, submitted: string[], crons: { cron: string; prompt: strin
   on('command.register', () => ({ value: undefined }) as never)
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('classic.SessionStart', () => ({}) as never)
+  profile = ME
+  stepStop = 'end_turn'
+  on('session.authorize', () => ({ value: profile ? { handle: 'h1', kind: 'bearer' } : null }) as never)
+  on('http.fetch', ($, e) => {
+    const ok = !!profile && e.url.endsWith('/api/oauth/profile') && e.init?.auth === 'h1'
+    return { value: { status: ok ? 200 : 401, ok, headers: {}, text: ok ? JSON.stringify(profile) : '' } } as never
+  })
   sessionCost = undefined
   stepCost = 0
   on('session.usage', () => ({ value: { rateLimits: [], context: { tokens: 250_000 }, ...(sessionCost === undefined ? {} : { cost: { usd: sessionCost } }) } }) as never)
@@ -166,7 +179,7 @@ function world(on: On, submitted: string[], crons: { cron: string; prompt: strin
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('turn.step', async function* ($, e) {
     if (sessionCost !== undefined) sessionCost += stepCost
-    return { turnId: e.turnId, index: e.index, answer: 'okay', toolUses: [], stopReason: 'end_turn', usage: stepResult } as never
+    return { turnId: e.turnId, index: e.index, answer: 'okay', toolUses: [], stopReason: stepStop, usage: stepResult } as never
   })
   // what another mod (clawd-buddy) or the engine draws in the band beneath caffeine
   on('ui.render', ($, e) => {
@@ -223,9 +236,10 @@ test('on, it pokes 55 minutes after the last request on a 1h cache, and not on a
   expect((await run($, 'off')).text).toBe('Caffeine off.')
 })
 
-test('a resumed session takes its cache clock from the engine, not from nothing', async ($, on) => {
+test('a resumed session on the account that made the last request takes its cache clock from the engine', async ($, on) => {
   const time = mock.clock(on, { now: at(9, 0) })
-  mock.store(on)
+  // the last request kept was this account's (conversation and model are '' here)
+  mock.store(on, { clocks: { 'org-me:acct-me||': { at: at(8, 38), t: at(8, 38) } } })
   mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
   const submitted: string[] = []
   world(on, submitted)
@@ -581,8 +595,12 @@ async function measured1h($: Engine, on: On, time: ReturnType<typeof mock.clock>
 test('a turn that finds the cache cold inside the hour, with no 1h reading of its own, takes the reading back', async ($, on) => {
   const time = mock.clock(on, { now: at(9, 0) })
   const request = await measured1h($, on, time, [])
-  // rewritten 20 minutes in, at no cost caffeine can read: timing's 5m stands
+  // rewritten 20 minutes in, at no cost caffeine can read: once could be an account switch, so 1h stands
   await request('t2', 'more', 0, { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 89_000 })
+  expect((await run($, 'status')).text).toContain('Cache TTL 1h (measured from what requests cost)')
+  // rewritten again inside the hour: timing's 5m stands
+  await time.advance(10 * MIN)
+  await request('t3', 'again', 0, { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 89_000 })
   const status = (await run($, 'status')).text
   expect(status).toContain('Cache TTL 5m (measured from request timing)')
   expect(status).not.toContain('measured from what requests cost')
@@ -623,16 +641,24 @@ test('a chance 1h cost reading is taken back by a cold cache inside the hour; po
   await time.advance(55 * MIN + 5_000)
   expect(submitted.length).toBe(1)
 
-  // the poke finds the cache cold 55 minutes in: the reading is gone, timing says 5m, and caffeine is off
+  // the poke finds the cache cold 55 minutes in: the reading is gone and caffeine is off, but one cold
+  // request does not yet make it 5m (an account switch does the same)
   await request('p1', 'poke, just say okay', 0, { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 89_000 })
-  const status = (await run($, 'status')).text
+  let status = (await run($, 'status')).text
   expect(status).toContain('caffeine off')
-  expect(status).toContain('Cache TTL 5m (measured from request timing)')
+  expect(status).toContain('Cache TTL 1h (the subscription default)')
   expect(status).not.toContain('measured from what requests cost')
+
+  // cold again inside the hour: timing says 5m
+  await request('t2', 'back', 0, { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 40 })
+  await time.advance(10 * MIN)
+  await request('t3', 'again', 0, { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 89_000 })
+  status = (await run($, 'status')).text
+  expect(status).toContain('Cache TTL 5m (measured from request timing)')
 
   // on again: the next request's poke comes 4 minutes after it
   await run($, 'on')
-  await request('t2', 'back', 0, { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 40 })
+  await request('t4', 'once more', 0, { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 40 })
   await time.advance(4 * MIN + 5_000)
   expect(submitted.length).toBe(2)
 })
@@ -837,6 +863,281 @@ test('keep-alive off, past the size line: compacts shortly before the cache expi
   await turn($, 't4', 'work')
   await time.advance(55 * MIN)
   expect(compactions.length).toBe(1)
+})
+
+test('an empty usage reading keeps the last TTL instead of guessing 5m; a TTL change is logged', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, {})
+  const submitted: string[] = []
+  compactions.length = 0
+  world(on, submitted)
+  await $.session.start({ cwd: 'D:\\work', surface: 'terminal', isInteractive: true })
+  const reading = (rateLimits: object[], tokens = 250_000) =>
+    $.session.measure({ changed: ['rateLimits'], context: { tokens, max: 1_000_000, percent: 1 }, rateLimits } as never)
+
+  // no reading yet: the 5m guess, until the first one shows a subscription
+  await reading([])
+  await reading([{ kind: 'five_hour', percentUsed: 3, resetsAt: new Date(at(13, 0)).toISOString() }])
+  await turn($, 't1', 'work')
+  expect((await run($, 'log')).text).toContain('cache TTL 改按 1h 算')
+
+  // a request fails (no network, a login swapped): the reading comes back empty, the TTL does not change
+  await reading([])
+  const status = (await run($, 'status')).text
+  expect(status).toContain('Cache TTL 1h (the subscription default, from the last usage reading)')
+  await time.advance(10 * MIN)
+  expect(compactions).toEqual([])
+  await time.advance(46 * MIN)
+  expect(compactions).toEqual(['plugin'])
+})
+
+test('skip compact cancels the booked compaction until the next request', { options: { band: 'on' } }, async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  world(on, [])
+  await $.session.start({ cwd: 'D:\\work', surface: 'terminal', isInteractive: true })
+  const mount = () => $.ui.mount({ plugin: 'caffeine-compact', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
+
+  expect((await run($, 'compact skip')).text).toContain('没有排好')
+  await measure($, 250_000)
+  await turn($, 't1', 'work')
+  let ui = await mount()
+  expect(await ui.find({ key: 'caffeine-skip' })).toBeDefined()
+  await ui.press({ key: 'caffeine-skip' })
+  await ui.unmount()
+  ui = await mount()
+  expect(await ui.find({ key: 'caffeine-skip' })).toBeUndefined()
+  expect((await run($, 'status')).text).toContain('已取消这次自动压缩')
+  await ui.unmount()
+  await time.advance(56 * MIN)
+  expect(compactions).toEqual([])
+
+  // the next request books the next one, and the command cancels it too
+  await turn($, 't2', 'work')
+  await time.advance(30 * MIN)
+  expect((await run($, 'compact skip')).text).toContain('已取消')
+  await time.advance(30 * MIN)
+  expect(compactions).toEqual([])
+  await turn($, 't3', 'work')
+  await time.advance(56 * MIN)
+  expect(compactions).toEqual(['plugin'])
+})
+
+const resumed = ($: Engine, minutesAgo: number, isExpired = false) =>
+  $.classic.SessionStart({ source: 'resume', seconds_since_last_response: minutesAgo * 60, context_tokens: 250_000, prompt_cache_likely_expired: isExpired } as never)
+const start = ($: Engine) => $.session.start({ cwd: 'D:\\work', surface: 'terminal', isInteractive: true })
+
+test('a new process on the same account keeps the 1h TTL and its kept clock, and compacts on time', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  // an earlier process saw a subscription reading and this account's last request at 8:57
+  mock.store(on, { planTtl: 3_600_000, clocks: { 'org-me:acct-me||': { at: at(8, 57), t: at(8, 57) } } })
+  mock.env(on, {})
+  compactions.length = 0
+  world(on, [])
+  await resumed($, 3)
+  await start($)
+  await measure($, 250_000)
+  expect((await run($, 'status')).text).toContain('Cache TTL 1h (the subscription default, from the last usage reading)')
+  // 55 minutes after 8:57, not 4
+  await time.advance(51 * MIN)
+  expect(compactions).toEqual([])
+  await time.advance(2 * MIN)
+  expect(compactions).toEqual(['plugin'])
+})
+
+test('after an account switch the conversation has no cache on this account: no clock, no fork, no compaction', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  // the last request was the other account's, 3 minutes ago; keep-alive was on
+  mock.store(on, {
+    clocks: { 'org-other:acct-other||': { at: at(8, 57), t: at(8, 57) } },
+    brews: { '': { isOn: true, until: 0, activeAt: at(8, 50), isForever: false, isAutoDeclined: false, t: at(8, 57) } },
+  })
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  forks = 0
+  forkUsage = { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 240_000, cache_creation_input_tokens: 50 }
+  world(on, [])
+  await resumed($, 3)
+  await start($)
+  await measure($, 250_000)
+  const status = (await run($, 'status')).text
+  expect(status).toContain('caffeine on')
+  expect(status).toContain('waits for the first reply')
+  await time.advance(60 * MIN)
+  expect(forks).toBe(0)
+  expect(compactions).toEqual([])
+  forkUsage = null
+})
+
+test('switched away and back within the hour: the account finds its own clock again', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  // this account worked at 8:30, the other at 8:57
+  mock.store(on, {
+    clocks: {
+      'org-me:acct-me||': { at: at(8, 30), t: at(8, 30) },
+      'org-other:acct-other||': { at: at(8, 57), t: at(8, 57) },
+    },
+  })
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  world(on, [])
+  await resumed($, 3)
+  await start($)
+  await measure($, 250_000)
+  // 55 minutes after 8:30
+  await time.advance(24 * MIN)
+  expect(compactions).toEqual([])
+  await time.advance(2 * MIN)
+  expect(compactions).toEqual(['plugin'])
+})
+
+test('nothing kept and keep-alive left on: the switch survives the restart and one fork settles the cache', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on, { brews: { '': { isOn: true, until: 0, activeAt: at(8, 50), isForever: false, isAutoDeclined: false, t: at(8, 57) } } })
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  forks = 0
+  // the cache was gone: the fork writes it again
+  forkUsage = { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 4_000, cache_creation_input_tokens: 240_000 }
+  const submitted: string[] = []
+  world(on, submitted)
+  await resumed($, 3)
+  await start($)
+  await measure($, 250_000)
+  expect((await run($, 'status')).text).toContain('checking whether the cache is still warm')
+  await time.advance(10_000)
+  expect(forks).toBe(1)
+  // it stays on, with a clock from the fork: the next poke 55 minutes on
+  expect((await run($, 'status')).text).toContain('caffeine on · poke at')
+  expect((await run($, 'log')).text).toContain('确认 cache：已经冷了')
+  await time.advance(54 * MIN)
+  expect(forks).toBe(1)
+  await time.advance(2 * MIN)
+  expect(forks).toBe(2)
+  expect(submitted).toEqual([])
+  forkUsage = null
+})
+
+test('nothing kept and keep-alive off: no clock, no compaction until your next message', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  forks = 0
+  world(on, [])
+  await resumed($, 3)
+  await start($)
+  await measure($, 250_000)
+  expect((await run($, 'status')).text).toContain('不知道 cache 还剩多久')
+  await time.advance(60 * MIN)
+  expect(forks).toBe(0)
+  expect(compactions).toEqual([])
+  // turned on: one fork settles it (nothing to fork here, so it waits for your message)
+  await run($, 'on')
+  await time.advance(10_000)
+  expect(forks).toBe(1)
+  expect((await run($, 'log')).text).toContain('确认 cache 的 fork 没成')
+})
+
+test('a failed request does not restart the cache clock', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  world(on, [])
+  await start($)
+  await measure($, 250_000)
+  await turn($, 't1', 'work')
+  await time.advance(30 * MIN)
+  // no network: no response
+  stepStop = null
+  await turn($, 't2', 'work')
+  stepStop = 'end_turn'
+  // still 55 minutes after t1, not after t2
+  await time.advance(26 * MIN)
+  expect(compactions).toEqual(['plugin'])
+})
+
+test('a compaction leaves a mark: a resume after it knows the cache is gone', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on, { clocks: { 'org-me:acct-me||': { at: 0, t: at(8, 58) } } })
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  forks = 0
+  world(on, [])
+  await resumed($, 3)
+  await start($)
+  await run($, 'on')
+  await time.advance(10_000)
+  expect(forks).toBe(0)
+  expect((await run($, 'status')).text).toContain('waits for the first reply')
+})
+
+test('the same reply reported again a second off does not move the cache clock', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  world(on, [])
+  await $.session.start({ cwd: 'D:\\work', surface: 'terminal', isInteractive: true })
+  await measure($, 250_000)
+  await turn($, 't1', 'work')
+  await time.advance(50 * MIN)
+  // the app reconnects: the engine says 3001s since the last reply (it was 3000s and a bit)
+  await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 50 * 60 - 1, context_tokens: 250_000, prompt_cache_likely_expired: false } as never)
+  expect((await run($, 'status')).text).not.toContain('恢复的会话')
+  await time.advance(6 * MIN)
+  expect(compactions).toEqual(['plugin'])
+})
+
+test('a skipped compaction stays skipped through a resume and comes back with your next turn', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  world(on, [])
+  await $.session.start({ cwd: 'D:\\work', surface: 'terminal', isInteractive: true })
+  await measure($, 250_000)
+  await turn($, 't1', 'work')
+  await time.advance(52 * MIN)
+  expect((await run($, 'compact skip')).text).toContain('已取消')
+  // the engine reports the reply again, seconds later than lastAt
+  await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 52 * 60 - 10, context_tokens: 250_000, prompt_cache_likely_expired: false } as never)
+  await time.advance(5 * MIN)
+  expect(compactions).toEqual([])
+  expect((await run($, 'status')).text).toContain('已取消这次自动压缩')
+  await turn($, 't2', 'work')
+  await time.advance(56 * MIN)
+  expect(compactions).toEqual(['plugin'])
+})
+
+test('the log keeps lines other sessions wrote after this one started', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  // the store all sessions share, written here by hand as another session would
+  const kept = new Map<string, unknown>([['log', ['10-27 09:00:00 another session']]])
+  on('store.get', ($, e) => ({ value: kept.get(e.key) }) as never)
+  on('store.set', ($, e) => {
+    kept.set(e.key, e.value)
+    return { value: undefined } as never
+  })
+  on('store.delete', ($, e) => {
+    kept.delete(e.key)
+    return { value: undefined } as never
+  })
+  on('store.keys', () => ({ value: [...kept.keys()] }) as never)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  world(on, [])
+  await $.session.start({ cwd: 'D:\\work', surface: 'terminal', isInteractive: true })
+  // another session appends while this one runs
+  kept.set('log', ['10-27 09:00:00 another session', '10-27 09:01:00 another session again'])
+  await measure($, 250_000)
+  await turn($, 't1', 'work')
+  await time.advance(56 * MIN)
+  const log = (await run($, 'log')).text
+  expect(log).toContain('another session again')
+  expect(log).toContain('自动压缩开始')
 })
 
 test('a usage wall ahead: past 95% with the reset beyond the cache, a big context compacts at once', async ($, on) => {
