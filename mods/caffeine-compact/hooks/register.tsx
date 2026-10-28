@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
 import type { Brew } from '../types'
 import {
@@ -113,6 +113,11 @@ type Caffeine = Brew & {
   size: number
   // the size line for compacting ahead of a usage wall (a window past 95%, its reset beyond the cache's life)
   wallSize: number
+  // how long before the cache expires a compaction starts, the usage percent a compaction ahead of a
+  // wall waits for, and how long before a compaction the auto band shows up (the config menu's)
+  compactLead: number
+  wallPercent: number
+  bandLead: number
   compactTried: number
   compacts: number
   // the TTL the last usage reading implied: kept when a later reading comes back empty (no network,
@@ -244,20 +249,96 @@ async function setting<T>($: EngineInterface, key: string, fallback: T): Promise
   }
 }
 
-async function load($: EngineInterface, c: Caffeine): Promise<void> {
+// The config menu's settings (/plugin, the plugin's options), in the units people type there:
+// thousands of tokens, hours, minutes, percent. A value out of range falls back to the default.
+type Prefs = {
+  size: number
+  wallSize: number
+  idle: number
+  compactOn: boolean
+  pokeMode: 'fork' | 'prompt'
+  every: number | null
+  compactLead: number
+  wallPercent: number
+  bandLead: number
+}
+
+function readPrefs(options: PluginOptions | undefined): Prefs {
+  const num = (key: string, fallback: number, min: number, max: number) => {
+    const v = options?.[key]
+    return typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max ? v : fallback
+  }
+  const every = num('every', 0, 0, 59)
+  return {
+    size: num('size', DEFAULT_SIZE / 1000, 1, 10_000) * 1000,
+    wallSize: num('limitsize', DEFAULT_WALL_SIZE / 1000, 1, 10_000) * 1000,
+    idle: num('idle', DEFAULT_IDLE / 3_600_000, 1 / 60, 24 * 30) * 3_600_000,
+    compactOn: options?.compact !== false,
+    pokeMode: options?.mode === 'prompt' ? 'prompt' : 'fork',
+    every: every >= 0.5 ? every * MINUTE : null,
+    compactLead: num('compactLead', 5, 1, 30) * MINUTE,
+    wallPercent: num('limitPercent', WALL_PERCENT, 50, 99),
+    bandLead: num('bandLead', 10, 0, 60) * MINUTE,
+  }
+}
+
+function applyPrefs(c: Caffeine, p: Prefs): void {
+  c.size = p.size
+  c.wallSize = p.wallSize
+  c.idle = p.idle
+  c.compactOn = p.compactOn
+  c.every = p.every
+  c.compactLead = p.compactLead
+  c.wallPercent = p.wallPercent
+  c.bandLead = p.bandLead
+  pokeMode = p.pokeMode
+}
+
+// Writes one of the config menu's settings; the menu shows it and new sessions start with it.
+async function setPref($: EngineInterface, field: string, value: string | number | boolean): Promise<void> {
+  await $.config.set({ key: `caffeine-compact.${field}`, value }).catch(() => undefined)
+}
+
+// Settings that 0.1.10 and before kept in the store, set by commands: each moves to its config
+// menu row once (in the menu's units), then leaves the store.
+const MOVED: readonly [string, string, (v: unknown) => string | number | boolean][] = [
+  ['size', 'size', v => Number(v) / 1000],
+  ['wallSize', 'limitsize', v => Number(v) / 1000],
+  ['idle', 'idle', v => Number(v) / 3_600_000],
+  ['compact', 'compact', v => v !== false],
+  ['pokeMode', 'mode', v => (v === 'prompt' ? 'prompt' : 'fork')],
+  ['every', 'every', v => (typeof v === 'number' ? v / MINUTE : 0)],
+]
+
+async function migrate($: EngineInterface): Promise<Record<string, string | number | boolean>> {
+  const moved: Record<string, string | number | boolean> = {}
+  for (const [key, field, to] of MOVED) {
+    let value: unknown
+    try {
+      value = await $.store.get(key)
+    } catch {
+      continue
+    }
+    if (value === undefined) continue
+    if (value !== null) {
+      moved[field] = to(value)
+      await setPref($, field, moved[field])
+    }
+    await Promise.resolve($.store.delete(key)).catch(() => undefined)
+  }
+  return moved
+}
+
+async function load($: EngineInterface, c: Caffeine, options?: PluginOptions): Promise<void> {
   c.message = await setting($, 'message', DEFAULT_MESSAGE)
-  c.every = (await setting($, 'every', null)) as number | null
-  c.idle = (await setting($, 'idle', DEFAULT_IDLE)) || DEFAULT_IDLE
   c.ttl = (await setting($, 'ttl', null)) as number | null
   c.autoAt = await setting($, 'autoAt', 0)
-  c.compactOn = await setting($, 'compact', true)
-  const savedMode = await setting<string | null>($, 'pokeMode', null)
-  if (savedMode === 'fork' || savedMode === 'prompt') pokeMode = savedMode
   const savedNotify = await setting<string | null>($, 'notify', null)
   if (savedNotify === 'quiet' || savedNotify === 'normal') notifyMode = savedNotify
   c.planTtl = c.planTtl ?? ((await setting($, 'planTtl', null)) as number | null)
-  c.size = (await setting($, 'size', DEFAULT_SIZE)) || DEFAULT_SIZE
-  c.wallSize = (await setting($, 'wallSize', DEFAULT_WALL_SIZE)) || DEFAULT_WALL_SIZE
+  // settings older versions kept in the store now live in the config menu: carried over once
+  const moved = await migrate($)
+  if (Object.keys(moved).length) applyPrefs(c, readPrefs({ ...options, ...moved }))
   // merged settings, as Claude Code reads them; a failed read leaves the key unset
   let promptCacheTtl: unknown
   try {
@@ -317,7 +398,7 @@ function standby(c: Caffeine, now: number): string {
   if (c.lastAt === 0) return ' · 压缩待命'
   if (c.context < c.size) return ` · 压缩待命（上下文 ${sized(c.context)}，到 ${sized(c.size)} 才自动压缩）`
   if (c.isSkipped) return ' · 已取消这次自动压缩（你下次发消息后恢复）'
-  const at = compactAt(c.lastAt, ttlOf(c))!
+  const at = compactAt(c.lastAt, ttlOf(c), c.compactLead)!
   if (c.compactTried === c.lastAt || now >= c.lastAt + ttlOf(c)) return ' · cache 已过期，不压缩'
   return ` · ${clock(at, now)} 自动压缩（${span(Math.max(0, at - now))}后）`
 }
@@ -392,8 +473,8 @@ function showBand(c: Caffeine, now: number): boolean {
   if (c.band !== 'auto') return c.band === 'on'
   if (c.isOn || c.isCompacting || c.isEditing) return true
   if (!c.compactOn || c.lastAt === 0 || c.context < c.size || c.compactTried === c.lastAt || c.isSkipped) return false
-  const at = compactAt(c.lastAt, ttlOf(c))!
-  return now >= at - 10 * MINUTE && now < c.lastAt + ttlOf(c)
+  const at = compactAt(c.lastAt, ttlOf(c), c.compactLead)!
+  return now >= at - c.bandLead && now < c.lastAt + ttlOf(c)
 }
 
 async function refresh($: EngineInterface, c: Caffeine): Promise<void> {
@@ -608,7 +689,7 @@ async function tick($: EngineInterface, c: Caffeine): Promise<void> {
   }
   // a usage wall ahead (a window past 95%, its reset beyond the cache's life): the cache dies before
   // work can resume, so shrink a big context now while it is warm, keep-alive on or off
-  const wall = wallAhead(c.limits, c.lastAt + ttlOf(c))
+  const wall = wallAhead(c.limits, c.lastAt + ttlOf(c), c.wallPercent)
   if (
     wall && c.compactOn && c.lastAt !== 0 && now < c.lastAt + ttlOf(c) && c.context >= c.wallSize &&
     c.compactTried !== c.lastAt && !c.isSkipped && !c.isCompacting && !c.isBusy && c.poke === 'none'
@@ -619,7 +700,7 @@ async function tick($: EngineInterface, c: Caffeine): Promise<void> {
   if (!c.isOn) {
     // keep-alive is off: past the size line, compact shortly before the cache expires
     const ttl = ttlOf(c)
-    const at = compactAt(c.lastAt, ttl)
+    const at = compactAt(c.lastAt, ttl, c.compactLead)
     if (
       c.compactOn && at !== null && now >= at && now < c.lastAt + ttl &&
       c.compactTried !== c.lastAt && !c.isSkipped && !c.isCompacting && !c.isBusy && c.poke === 'none' && !c.armed &&
@@ -871,6 +952,7 @@ async function forever($: EngineInterface, c: Caffeine, isSure: boolean): Promis
 
 const help = [
   'caffeine-compact：保活 + 自动压缩。命令都是 /caffeine …',
+  '常用设置（大小线、保活时长、自动压缩开关、保活方式、戳的间隔、压缩提前量、限额线、状态栏）也能在 /plugin 的配置菜单里改，下面的命令改的是同一份设置。',
   '',
   '【离开前 / 回来后】',
   '/caffeine                开保活（已开着就保持不变；开着时每 55 分钟读一次缓存续命）。关闭用 /caffeine off 或点 turn off',
@@ -881,7 +963,7 @@ const help = [
   '/caffeine forever         这次保活不设终点，会先让你确认（idle off 同效）；关掉后恢复 idle 终点',
   '',
   '【自动压缩】',
-  '/caffeine compact on|off  自动压缩开关（默认开）',
+  '/caffeine compact on|off  自动压缩开关（默认开）。关掉就只剩保活：过期前压缩和限额前提前压缩都不做',
   '/caffeine compact now     立刻压缩一次，用来测试；结果或失败原因以提示显示',
   '/caffeine compact skip    取消排好的这一次自动压缩（输入框上方的 skip compact 按钮，快捷键 x，同效）；下一条消息后恢复',
   '/caffeine size 180k       大小线：没开保活时，上下文到这个值以上才会在 cache 过期前（最后一次请求后 55 分钟）压缩（default 恢复 200k）',
@@ -1041,6 +1123,8 @@ async function hold($: EngineInterface, c: Caffeine, by: string): Promise<void> 
 export const register: Register = (on, options) => {
   const bandOption = options?.band
   if (options?.notify === 'normal' || options?.notify === 'quiet') notifyMode = options.notify
+  const prefs = readPrefs(options)
+  pokeMode = prefs.pokeMode
   const c: Caffeine = {
     isOn: false,
     until: 0,
@@ -1069,9 +1153,9 @@ export const register: Register = (on, options) => {
     coldAt: 0,
     coldGap: 0,
     message: DEFAULT_MESSAGE,
-    every: null,
+    every: prefs.every,
     band: bandOption === 'on' || bandOption === 'off' ? bandOption : 'auto',
-    idle: DEFAULT_IDLE,
+    idle: prefs.idle,
     autoAt: 0,
     isEditing: false,
     bandId: '',
@@ -1085,9 +1169,12 @@ export const register: Register = (on, options) => {
     compactSentAt: 0,
     compactTurn: false,
     compactManual: false,
-    compactOn: true,
-    size: DEFAULT_SIZE,
-    wallSize: DEFAULT_WALL_SIZE,
+    compactOn: prefs.compactOn,
+    size: prefs.size,
+    wallSize: prefs.wallSize,
+    compactLead: prefs.compactLead,
+    wallPercent: prefs.wallPercent,
+    bandLead: prefs.bandLead,
     compactTried: 0,
     compacts: 0,
     planTtl: null,
@@ -1117,7 +1204,7 @@ export const register: Register = (on, options) => {
       argumentHint: '[on|off|status|warm|until|wake|ttl|every|idle|auto|cost|poke|message|band|compact|size|limitsize|mode|notify|log|forever|help]',
     })
     const started = await next(e)
-    await load($, c)
+    await load($, c, options)
     let isReload = false
     try {
       const state = await read($, brew)
@@ -1420,12 +1507,12 @@ export const register: Register = (on, options) => {
           return { text: '已取消这次自动压缩。你发下一条消息后，会按新的 cache 重新排。' }
         }
         c.compactOn = v === 'on' ? true : v === 'off' ? false : !c.compactOn
-        await $.store.set('compact', c.compactOn)
+        await setPref($, 'compact', c.compactOn)
         await refresh($, c)
         return {
           text: c.compactOn
             ? `自动压缩已开：上下文到 ${sized(c.size)} 以上、保活关闭（或保活到时）时，在 cache 过期前压缩一次。`
-            : '自动压缩已关。',
+            : '自动压缩已关（普通压缩和限额前提前压缩都不做，只剩保活）。',
         }
       }
       case 'size': {
@@ -1434,19 +1521,19 @@ export const register: Register = (on, options) => {
         const n = v === 'default' ? DEFAULT_SIZE : /^(\d+(?:\.\d+)?)(k|m)?$/.test(v) ? Math.round(Number.parseFloat(v) * (v.endsWith('m') ? 1e6 : v.endsWith('k') ? 1e3 : 1)) : null
         if (n === null || n < 1000) return { text: `Not a token count I know: ${value}. Try 300k, or default.` }
         c.size = n
-        await $.store.set('size', n)
+        await setPref($, 'size', n / 1000)
         await refresh($, c)
         return { text: `上下文到 ${sized(n)} 以上才自动压缩（现在 ${sized(c.context)}）。` }
       }
       case 'limitsize': {
         const v = value.toLowerCase()
-        if (!v) return { text: `5h 或周用量到 ${WALL_PERCENT}%、离重置超过 cache 寿命时，上下文到 ${sized(c.wallSize)} 以上就提前压缩。/caffeine limitsize 250k 可改。` }
+        if (!v) return { text: `5h 或周用量到 ${c.wallPercent}%、离重置超过 cache 寿命时，上下文到 ${sized(c.wallSize)} 以上就提前压缩。/caffeine limitsize 250k 可改。` }
         const n = v === 'default' ? DEFAULT_WALL_SIZE : /^(\d+(?:\.\d+)?)(k|m)?$/.test(v) ? Math.round(Number.parseFloat(v) * (v.endsWith('m') ? 1e6 : v.endsWith('k') ? 1e3 : 1)) : null
         if (n === null || n < 1000) return { text: `Not a token count I know: ${value}. Try 250k, or default.` }
         c.wallSize = n
-        await $.store.set('wallSize', n)
+        await setPref($, 'limitsize', n / 1000)
         await refresh($, c)
-        return { text: `用量到 ${WALL_PERCENT}% 时，上下文到 ${sized(n)} 以上就提前压缩（现在 ${sized(c.context)}）。` }
+        return { text: `用量到 ${c.wallPercent}% 时，上下文到 ${sized(n)} 以上就提前压缩（现在 ${sized(c.context)}）。` }
       }
       case 'log': {
         const v = value.toLowerCase()
@@ -1466,7 +1553,7 @@ export const register: Register = (on, options) => {
           return { text: `保活方式：${pokeMode}。/caffeine mode fork（默认：后台读缓存续命，不进对话）| prompt（发一条 poke 消息，会留在对话里）` }
         }
         pokeMode = v
-        await $.store.set('pokeMode', v)
+        await setPref($, 'mode', v)
         return { text: v === 'fork' ? '保活方式：fork，后台读缓存续命，对话里没有 poke 消息；fork 失败时自动改发 poke。' : '保活方式：prompt，每次发一条 poke 消息。' }
       }
       case 'notify': {
@@ -1501,7 +1588,7 @@ export const register: Register = (on, options) => {
       case 'every': {
         if (!value || value === 'auto') {
           c.every = null
-          await $.store.set('every', null)
+          await setPref($, 'every', 0)
           await refresh($, c)
           return { text: `Poking ${span(everyOf(c))} after the last request (auto, ${ttlLabel(ttlOf(c))} cache).` }
         }
@@ -1509,7 +1596,7 @@ export const register: Register = (on, options) => {
         if (ms === null || ms < 30_000) return { text: `Not a duration I know (30s or more): ${value}.` }
         if (ms >= ttlOf(c)) return { text: `${span(ms)} is past the ${ttlLabel(ttlOf(c))} cache: it would be cold by then.` }
         c.every = ms
-        await $.store.set('every', ms)
+        await setPref($, 'every', ms / MINUTE)
         await refresh($, c)
         return { text: `Poking ${span(ms)} after the last request.` }
       }
@@ -1531,8 +1618,9 @@ export const register: Register = (on, options) => {
         }
         const ms = parseDuration(value)
         if (ms === null) return { text: `Not a duration I know: ${value || '(none)'}. Try 8h, or off for no end this time.` }
+        if (ms < MINUTE) return { text: 'At least a minute.' }
         c.idle = ms
-        await $.store.set('idle', ms)
+        await setPref($, 'idle', ms / 3_600_000)
         return { text: `Caffeine turns itself off after ${span(ms)} without a turn of your own.` }
       }
       case 'band': {
@@ -1555,7 +1643,7 @@ export const register: Register = (on, options) => {
           `Cache TTL ${ttlLabel(ttlOf(c))} (${ttlSource(c)}) · poke ${span(everyOf(c))} after the last request${c.every === null ? ' (auto)' : ''}`,
           `${c.isForever ? 'No idle stop this time: on until you turn it off' : `Off by itself after ${span(c.idle)} idle`} · auto ${c.autoAt ? `past ${sized(c.autoAt)}` : 'off'} · band ${c.band}`,
           `自动压缩 ${c.compactOn ? '开' : '关'} · 大小线 ${sized(c.size)}（现在 ${sized(c.context)}）· 已压缩 ${c.compacts} 次${c.isOn ? '' : standby(c, now)}`,
-          `限额前提前压缩：用量到 ${WALL_PERCENT}% 且上下文到 ${sized(c.wallSize)} 以上`,
+          `限额前提前压缩：用量到 ${c.wallPercent}% 且上下文到 ${sized(c.wallSize)} 以上`,
           c.lastWarm === null ? '' : `The last poke found the cache ${c.lastWarm ? 'warm' : 'cold'}.`,
           c.coldAt ? `The cache last went cold before ${clock(c.coldAt, now)}, after ${span(c.coldGap)} idle.` : '',
           `The poke says: ${c.message}`,

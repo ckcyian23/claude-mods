@@ -1,10 +1,44 @@
 {
   "name": "caffeine-compact",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "保活 + 自动压缩二合一：上下文不大不管；超过大小线时，没开保活就在 prompt cache 过期前自动压缩，开了保活就保活一段固定时长，期间你没发新消息就在 cache 过期前压缩并关闭保活。基于 lperezmo/cache-caffeine（MIT）。",
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
+    "compact": {
+      "type": "boolean",
+      "title": "自动压缩",
+      "description": "关掉就只保活：cache 过期前的压缩和限额前提前压缩都不做",
+      "default": true
+    },
+    "size": {
+      "type": "number",
+      "title": "自动压缩大小线（k tokens）",
+      "description": "上下文到这个值以上，没开保活时才会在 cache 过期前自动压缩。200 即 200k",
+      "default": 200
+    },
+    "idle": {
+      "type": "number",
+      "title": "保活时长（小时）",
+      "description": "从你最后一条消息算起，这么久没发新消息就关保活。可以写小数，0.5 即 30 分钟",
+      "default": 24
+    },
+    "mode": {
+      "type": "string",
+      "title": "保活方式",
+      "description": "fork：后台读缓存续命，对话里没有 poke 消息；prompt：每次发一条 poke 消息",
+      "default": "fork",
+      "options": [
+        "fork",
+        "prompt"
+      ]
+    },
+    "every": {
+      "type": "number",
+      "title": "戳的间隔（分钟）",
+      "description": "上次请求后多久戳一次。0 为自动：1 小时 cache 55 分钟，5 分钟 cache 4 分钟",
+      "default": 0
+    },
     "band": {
       "type": "string",
       "title": "状态栏显示",
@@ -25,6 +59,30 @@
         "quiet",
         "normal"
       ]
+    },
+    "compactLead": {
+      "type": "number",
+      "title": "压缩提前量（分钟）",
+      "description": "在 cache 过期前多少分钟开始自动压缩（1–30）。5 分钟 cache 最多提前 1 分钟",
+      "default": 5
+    },
+    "limitsize": {
+      "type": "number",
+      "title": "限额前提前压缩大小线（k tokens）",
+      "description": "用量快到限额、重置又晚于 cache 过期时，上下文到这个值以上就立刻压缩",
+      "default": 220
+    },
+    "limitPercent": {
+      "type": "number",
+      "title": "限额前提前压缩触发线（%）",
+      "description": "5h 或周用量到这个百分比（未满 100%）才考虑提前压缩（50–99）",
+      "default": 95
+    },
+    "bandLead": {
+      "type": "number",
+      "title": "状态栏提前显示（分钟）",
+      "description": "状态栏为 auto 时，自动压缩前多少分钟开始显示（0–60）",
+      "default": 10
     }
   }
 }

@@ -26,9 +26,9 @@ export const DEFAULT_SIZE = 200_000
 
 // Compaction starts this long before the cache expires: a big summary pass takes minutes,
 // and it only reads the cache if it starts while the cache is still warm.
-export function compactAt(lastAt: number, ttl: number): number | null {
+export function compactAt(lastAt: number, ttl: number, lead = 5 * minute): number | null {
   if (lastAt === 0) return null
-  return lastAt + ttl - Math.min(5 * minute, Math.round(ttl / 5))
+  return lastAt + ttl - Math.min(lead, Math.round(ttl / 5))
 }
 
 // Pokes stop only when a window is full: no request goes through then. Below it a poke costs
@@ -62,9 +62,9 @@ export const WALL_PERCENT = 95
 export const DEFAULT_WALL_SIZE = 220_000
 
 // The window about to block, or null. Under 100%: at 100% no request goes through.
-export function wallAhead(limits: readonly Limit[], cacheEnds: number): { label: string; percent: number; resetsAt: number | null } | null {
+export function wallAhead(limits: readonly Limit[], cacheEnds: number, percent = WALL_PERCENT): { label: string; percent: number; resetsAt: number | null } | null {
   for (const l of limits) {
-    if (!(l.kind in LIMIT_LINE) || l.percentUsed < WALL_PERCENT || l.percentUsed >= 100) continue
+    if (!(l.kind in LIMIT_LINE) || l.percentUsed < percent || l.percentUsed >= 100) continue
     const reset = l.resetsAt ? Date.parse(l.resetsAt) : Number.NaN
     const resetsAt = Number.isNaN(reset) ? null : reset
     if (resetsAt === null || resetsAt > cacheEnds) {

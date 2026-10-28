@@ -1153,6 +1153,86 @@ test('the log keeps lines other sessions wrote after this one started', async ($
   expect(log).toContain('自动压缩开始')
 })
 
+test('the config menu sets the size line, the lead and the wall percent', { options: { size: 300, compactLead: 10, limitPercent: 90, limitsize: 260 } }, async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  world(on, [])
+  await start($)
+  const measureWith = (tokens: number, rateLimits: object[] = []) =>
+    $.session.measure({ changed: ['context', 'rateLimits'], context: { tokens, max: 1_000_000, percent: 1 }, rateLimits } as never)
+
+  // under the 300k line: nothing
+  await measureWith(250_000)
+  await turn($, 't1', 'work')
+  await time.advance(60 * MIN)
+  expect(compactions).toEqual([])
+
+  // past it: 10 minutes before the cache expires, not 5
+  await measureWith(350_000)
+  await turn($, 't2', 'work')
+  await time.advance(49 * MIN)
+  expect(compactions).toEqual([])
+  await time.advance(2 * MIN)
+  expect(compactions).toEqual(['plugin'])
+
+  // the wall at 90%, not 95%, with the 260k line
+  await turn($, 't3', 'work')
+  await measureWith(270_000, [{ kind: 'five_hour', percentUsed: 92, resetsAt: new Date(time.now() + 180 * MIN).toISOString() }])
+  await time.advance(10_000)
+  expect(compactions.length).toBe(2)
+})
+
+test('automatic compaction off leaves keep-alive alone: no compaction of either kind', { options: { compact: false } }, async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  forks = 0
+  forkUsage = { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 400_000, cache_creation_input_tokens: 50 }
+  world(on, [])
+  await start($)
+  await $.session.measure({ changed: ['context', 'rateLimits'], context: { tokens: 400_000, max: 1_000_000, percent: 1 }, rateLimits: [{ kind: 'five_hour', percentUsed: 97, resetsAt: new Date(at(13, 0)).toISOString() }] } as never)
+  await turn($, 't1', 'work')
+  await time.advance(10_000)
+  expect(compactions).toEqual([])
+  await run($, 'on')
+  await time.advance(56 * MIN)
+  expect(forks).toBe(1)
+  await run($, 'off')
+  await time.advance(60 * MIN)
+  expect(compactions).toEqual([])
+  forkUsage = null
+})
+
+test('settings older versions kept in the store move to the config menu once', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on, { size: 180_000, idle: 2 * 3_600_000, pokeMode: 'prompt', every: null })
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  const sets: { key: string; value: unknown }[] = []
+  on('config.set', ($, e) => {
+    sets.push({ key: e.key, value: e.value })
+    return { value: e.value } as never
+  })
+  world(on, [])
+  await start($)
+  expect(sets).toEqual([
+    { key: 'caffeine-compact.size', value: 180 },
+    { key: 'caffeine-compact.idle', value: 2 },
+    { key: 'caffeine-compact.mode', value: 'prompt' },
+  ])
+  // this process already works from them: 190k is past the 180k line
+  await measure($, 190_000)
+  await turn($, 't1', 'work')
+  await time.advance(56 * MIN)
+  expect(compactions).toEqual(['plugin'])
+  // a command writes the menu too
+  await run($, 'size 250k')
+  expect(sets.at(-1)).toEqual({ key: 'caffeine-compact.size', value: 250 })
+})
+
 test('a usage wall ahead: past 95% with the reset beyond the cache, a big context compacts at once', async ($, on) => {
   const time = mock.clock(on, { now: at(9, 0) })
   mock.store(on)
