@@ -873,7 +873,7 @@ const help = [
   'caffeine-compact：保活 + 自动压缩。命令都是 /caffeine …',
   '',
   '【离开前 / 回来后】',
-  '/caffeine                开或关保活（开着时每 55 分钟读一次缓存续命）',
+  '/caffeine                开保活（已开着就保持不变；开着时每 55 分钟读一次缓存续命）。关闭用 /caffeine off 或点 turn off',
   '/caffeine on | off        同上，明确指定',
   '/caffeine warm 2h         保活 2 小时，到点关（90m、1h30m 也行；不写时长默认 1h）',
   '/caffeine until 18:00     保活到 18:00（6pm 也行）',
@@ -1362,9 +1362,10 @@ export const register: Register = (on, options) => {
       case 'help':
         return { text: help }
       case '':
-        if (c.isOn) c.isAutoDeclined = true
-        await switchOn($, c, !c.isOn)
-        return { text: c.isOn ? `Caffeine on: ${describe(c, now).text.replace(/^caffeine on · /, '')}.` : 'Caffeine off.' }
+        // turns it on, never off: run twice by mistake it stays on (off is /caffeine off or the band's turn off)
+        if (c.isOn) return { text: `Caffeine already on: ${describe(c, now).text.replace(/^caffeine on · /, '')}. /caffeine off turns it off.` }
+        await switchOn($, c, true)
+        return { text: `Caffeine on: ${describe(c, now).text.replace(/^caffeine on · /, '')}.` }
       case 'on':
         await switchOn($, c, true)
         return { text: `Caffeine on until you turn it off, poking ${span(everyOf(c))} after the last request (${ttlLabel(ttlOf(c))} cache).` }

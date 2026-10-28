@@ -1,6 +1,6 @@
 {
   "name": "caffeine-compact",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "保活 + 自动压缩二合一：上下文不大不管；超过大小线时，没开保活就在 prompt cache 过期前自动压缩，开了保活就保活一段固定时长，期间你没发新消息就在 cache 过期前压缩并关闭保活。基于 lperezmo/cache-caffeine（MIT）。",
   "license": "MIT",
   "types": "./types/index.d.ts",

@@ -236,6 +236,19 @@ test('on, it pokes 55 minutes after the last request on a 1h cache, and not on a
   expect((await run($, 'off')).text).toBe('Caffeine off.')
 })
 
+test('/caffeine alone turns it on and keeps it on; off is /caffeine off', async ($, on) => {
+  mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  world(on, [])
+  await $.session.start({ cwd: 'D:\\work', surface: 'terminal', isInteractive: true })
+  expect((await run($, '')).text).toContain('Caffeine on')
+  expect((await run($, '')).text).toContain('Caffeine already on')
+  expect((await run($, 'status')).text).toContain('caffeine on')
+  expect((await run($, 'off')).text).toBe('Caffeine off.')
+  expect((await run($, 'status')).text).toContain('caffeine off')
+})
+
 test('a resumed session on the account that made the last request takes its cache clock from the engine', async ($, on) => {
   const time = mock.clock(on, { now: at(9, 0) })
   // the last request kept was this account's (conversation and model are '' here)
