@@ -118,6 +118,12 @@ type Caffeine = Brew & {
   compactLead: number
   wallPercent: number
   bandLead: number
+  // the settings in layers: the config menu's as this process loaded them, the global values as the
+  // store last had them (a change in any session reaches every open one), this conversation's own
+  options: PluginOptions | undefined
+  shared: RawPrefs
+  local: RawPrefs
+  prefsSeen: string
   compactTried: number
   compacts: number
   // the TTL the last usage reading implied: kept when a later reading comes back empty (no network,
@@ -294,9 +300,98 @@ function applyPrefs(c: Caffeine, p: Prefs): void {
   pokeMode = p.pokeMode
 }
 
-// Writes one of the config menu's settings; the menu shows it and new sessions start with it.
-async function setPref($: EngineInterface, field: string, value: string | number | boolean): Promise<void> {
-  await $.config.set({ key: `caffeine-compact.${field}`, value }).catch(() => undefined)
+// Settings in the config menu's units, by field: the global layer and a conversation's own.
+type RawPrefs = Record<string, string | number | boolean>
+type KeptPrefs = { values: RawPrefs; t: number }
+// the settings a conversation can set for itself (`/caffeine size 300k here`), by command
+const LOCAL_FIELD: Record<string, string> = { compact: 'compact', size: 'size', limitsize: 'limitsize', idle: 'idle', mode: 'mode', every: 'every' }
+
+// One read-modify-write of a shared store key at a time.
+function editStore<T>($: EngineInterface, key: string, fallback: T, edit: (value: T, now: number) => T): Promise<void> {
+  storeChain = storeChain
+    .then(async () => {
+      const now = await $.clock.now()
+      await $.store.set(key, edit(await setting<T>($, key, fallback), now))
+    })
+    .catch(() => undefined)
+  return storeChain
+}
+
+// A global setting: kept in the store, where every open session picks it up within half a minute,
+// and in the config menu, which shows it and which new sessions start from.
+async function setShared($: EngineInterface, field: string, value: string | number | boolean): Promise<void> {
+  await editStore<KeptPrefs | null>($, 'prefs', null, (kept, now) => ({ values: { ...(kept?.values ?? {}), [field]: value }, t: now }))
+}
+
+// Reads the global and this conversation's layers; a change applies at once.
+async function syncPrefs($: EngineInterface, c: Caffeine): Promise<void> {
+  await storeChain
+  const shared = (await setting<KeptPrefs | null>($, 'prefs', null))?.values ?? {}
+  const local = (await setting<Record<string, KeptPrefs>>($, 'local', {}))[await sessionKey($)]?.values ?? {}
+  const seen = JSON.stringify([shared, local])
+  if (seen === c.prefsSeen) return
+  c.prefsSeen = seen
+  c.shared = shared
+  c.local = local
+  applyPrefs(c, readPrefs({ ...c.options, ...shared, ...local }))
+  await refresh($, c)
+}
+
+// Sets one setting, globally or (`here`) for this conversation alone. A global change says so when
+// this conversation has its own value for it, which still wins here.
+async function setPref($: EngineInterface, c: Caffeine, field: string, value: string | number | boolean, isHere = false): Promise<string> {
+  if (isHere) {
+    const session = await sessionKey($)
+    await editStore<Record<string, KeptPrefs>>($, 'local', {}, (all, now) => {
+      const next = { ...all }
+      for (const [k, v] of Object.entries(next)) if (now - v.t > 30 * DAY) delete next[k]
+      next[session] = { values: { ...(next[session]?.values ?? {}), [field]: value }, t: now }
+      return next
+    })
+  } else {
+    await setShared($, field, value)
+  }
+  await syncPrefs($, c)
+  const command = Object.keys(LOCAL_FIELD).find(k => LOCAL_FIELD[k] === field) ?? field
+  const said = isHere
+    ? '（只对这个对话生效）'
+    : field in c.local
+      ? `（全局已改；这个对话单独设过，仍按本对话的算，/caffeine ${command} global 改回跟随全局）`
+      : ''
+  // the menu row, last: the write reloads this module with it
+  if (!isHere) await $.config.set({ key: `caffeine-compact.${field}`, value }).catch(() => undefined)
+  return said
+}
+
+// Drops this conversation's own value for one setting: it follows the global one again.
+async function clearLocal($: EngineInterface, c: Caffeine, field: string): Promise<void> {
+  const session = await sessionKey($)
+  await editStore<Record<string, KeptPrefs>>($, 'local', {}, (all, now) => {
+    const next = { ...all }
+    const values = { ...(next[session]?.values ?? {}) }
+    delete values[field]
+    if (Object.keys(values).length) next[session] = { values, t: now }
+    else delete next[session]
+    return next
+  })
+  await syncPrefs($, c)
+}
+
+// This conversation's own settings, for /caffeine status.
+function localText(c: Caffeine): string {
+  const say = (field: string, v: string | number | boolean) =>
+    field === 'size' || field === 'limitsize'
+      ? `${field} ${v}k`
+      : field === 'idle'
+        ? `idle ${v}h`
+        : field === 'every'
+          ? `every ${v ? `${v}m` : 'auto'}`
+          : field === 'compact'
+            ? `compact ${v ? 'on' : 'off'}`
+            : `${field} ${String(v)}`
+  return Object.entries(c.local)
+    .map(([k, v]) => say(k, v))
+    .join('、')
 }
 
 // Settings that 0.1.10 and before kept in the store, set by commands: each moves to its config
@@ -322,7 +417,8 @@ async function migrate($: EngineInterface): Promise<Record<string, string | numb
     if (value === undefined) continue
     if (value !== null) {
       moved[field] = to(value)
-      await setPref($, field, moved[field])
+      await setShared($, field, moved[field])
+      await $.config.set({ key: `caffeine-compact.${field}`, value: moved[field] }).catch(() => undefined)
     }
     await Promise.resolve($.store.delete(key)).catch(() => undefined)
   }
@@ -337,8 +433,9 @@ async function load($: EngineInterface, c: Caffeine, options?: PluginOptions): P
   if (savedNotify === 'quiet' || savedNotify === 'normal') notifyMode = savedNotify
   c.planTtl = c.planTtl ?? ((await setting($, 'planTtl', null)) as number | null)
   // settings older versions kept in the store now live in the config menu: carried over once
-  const moved = await migrate($)
-  if (Object.keys(moved).length) applyPrefs(c, readPrefs({ ...options, ...moved }))
+  await migrate($)
+  c.options = options
+  await syncPrefs($, c)
   // merged settings, as Claude Code reads them; a failed read leaves the key unset
   let promptCacheTtl: unknown
   try {
@@ -952,7 +1049,8 @@ async function forever($: EngineInterface, c: Caffeine, isSure: boolean): Promis
 
 const help = [
   'caffeine-compact：保活 + 自动压缩。命令都是 /caffeine …',
-  '常用设置（大小线、保活时长、自动压缩开关、保活方式、戳的间隔、压缩提前量、限额线、状态栏）也能在 /plugin 的配置菜单里改，下面的命令改的是同一份设置。',
+  '常用设置（大小线、保活时长、自动压缩开关、保活方式、戳的间隔、压缩提前量、限额线、状态栏）也能在 /plugin 的配置菜单里改，下面的命令改的是同一份全局设置，所有对话半分钟内跟着变。',
+  'compact、size、limitsize、idle、every、mode 这几个命令末尾加 here 只改这个对话（如 /caffeine size 300k here），加 global 让这个对话改回跟随全局（如 /caffeine size global）。',
   '',
   '【离开前 / 回来后】',
   '/caffeine                开保活（已开着就保持不变；开着时每 55 分钟读一次缓存续命）。关闭用 /caffeine off 或点 turn off',
@@ -1175,6 +1273,10 @@ export const register: Register = (on, options) => {
     compactLead: prefs.compactLead,
     wallPercent: prefs.wallPercent,
     bandLead: prefs.bandLead,
+    options,
+    shared: {},
+    local: {},
+    prefsSeen: '',
     compactTried: 0,
     compacts: 0,
     planTtl: null,
@@ -1240,10 +1342,24 @@ export const register: Register = (on, options) => {
     $.clock.every(5_000, () => void tick($, c))
     // the countdowns
     $.clock.every(30_000, () => {
+      // a setting changed in another session reaches this one
+      void syncPrefs($, c)
       if (c.isOn || c.armed || c.compactOn || isNear(c.limits) || c.lastAt) void refresh($, c)
     })
     await refresh($, c)
     return started
+  })
+
+  // A change in the config menu is a global one: the store carries it to every open session (this
+  // process reloads with it anyway).
+  on('config.set', async ($, e, next) => {
+    const done = await next(e)
+    const field = e.key.startsWith('caffeine-compact.') ? e.key.slice('caffeine-compact.'.length) : ''
+    if (field && !('deny' in done) && !Array.isArray(e.value)) {
+      await setShared($, field, e.value as string | number | boolean)
+      await syncPrefs($, c)
+    }
+    return done
   })
 
   on('session.measure', async ($, e, next) => {
@@ -1443,7 +1559,16 @@ export const register: Register = (on, options) => {
     const args = e.args.trim()
     const [word = '', ...rest] = args.split(/\s+/)
     const arg = word.toLowerCase()
-    const value = rest.join(' ').trim()
+    const raw = rest.join(' ').trim()
+    // `… here` sets one of the conversation's own settings for this conversation alone; `… global`
+    // drops it, so the global value applies here again
+    const localField = LOCAL_FIELD[arg]
+    const isHere = localField !== undefined && /(^|\s)here$/i.test(raw)
+    const value = isHere ? raw.replace(/\s*here$/i, '') : raw
+    if (localField && value.toLowerCase() === 'global') {
+      await clearLocal($, c, localField)
+      return { text: `这个对话的 ${arg} 改回跟随全局设置。` }
+    }
     const now = await $.clock.now()
     switch (arg) {
       case 'help':
@@ -1506,13 +1631,11 @@ export const register: Register = (on, options) => {
           await skipCompact($, c)
           return { text: '已取消这次自动压缩。你发下一条消息后，会按新的 cache 重新排。' }
         }
-        c.compactOn = v === 'on' ? true : v === 'off' ? false : !c.compactOn
-        await setPref($, 'compact', c.compactOn)
-        await refresh($, c)
+        const scope = await setPref($, c, 'compact', v === 'on' ? true : v === 'off' ? false : !c.compactOn, isHere)
         return {
           text: c.compactOn
-            ? `自动压缩已开：上下文到 ${sized(c.size)} 以上、保活关闭（或保活到时）时，在 cache 过期前压缩一次。`
-            : '自动压缩已关（普通压缩和限额前提前压缩都不做，只剩保活）。',
+            ? `自动压缩已开${scope}：上下文到 ${sized(c.size)} 以上、保活关闭（或保活到时）时，在 cache 过期前压缩一次。`
+            : `自动压缩已关${scope}：普通压缩和限额前提前压缩都不做，只剩保活。`,
         }
       }
       case 'size': {
@@ -1520,20 +1643,16 @@ export const register: Register = (on, options) => {
         if (!v) return { text: `上下文不到 ${sized(c.size)} 时不自动压缩（手动开的保活不受影响）。/caffeine size 60k 可改。` }
         const n = v === 'default' ? DEFAULT_SIZE : /^(\d+(?:\.\d+)?)(k|m)?$/.test(v) ? Math.round(Number.parseFloat(v) * (v.endsWith('m') ? 1e6 : v.endsWith('k') ? 1e3 : 1)) : null
         if (n === null || n < 1000) return { text: `Not a token count I know: ${value}. Try 300k, or default.` }
-        c.size = n
-        await setPref($, 'size', n / 1000)
-        await refresh($, c)
-        return { text: `上下文到 ${sized(n)} 以上才自动压缩（现在 ${sized(c.context)}）。` }
+        const scope = await setPref($, c, 'size', n / 1000, isHere)
+        return { text: `上下文到 ${sized(n)} 以上才自动压缩${scope}，现在 ${sized(c.context)}。` }
       }
       case 'limitsize': {
         const v = value.toLowerCase()
         if (!v) return { text: `5h 或周用量到 ${c.wallPercent}%、离重置超过 cache 寿命时，上下文到 ${sized(c.wallSize)} 以上就提前压缩。/caffeine limitsize 250k 可改。` }
         const n = v === 'default' ? DEFAULT_WALL_SIZE : /^(\d+(?:\.\d+)?)(k|m)?$/.test(v) ? Math.round(Number.parseFloat(v) * (v.endsWith('m') ? 1e6 : v.endsWith('k') ? 1e3 : 1)) : null
         if (n === null || n < 1000) return { text: `Not a token count I know: ${value}. Try 250k, or default.` }
-        c.wallSize = n
-        await setPref($, 'limitsize', n / 1000)
-        await refresh($, c)
-        return { text: `用量到 ${c.wallPercent}% 时，上下文到 ${sized(n)} 以上就提前压缩（现在 ${sized(c.context)}）。` }
+        const scope = await setPref($, c, 'limitsize', n / 1000, isHere)
+        return { text: `用量到 ${c.wallPercent}% 时，上下文到 ${sized(n)} 以上就提前压缩${scope}，现在 ${sized(c.context)}。` }
       }
       case 'log': {
         const v = value.toLowerCase()
@@ -1552,9 +1671,8 @@ export const register: Register = (on, options) => {
         if (v !== 'fork' && v !== 'prompt') {
           return { text: `保活方式：${pokeMode}。/caffeine mode fork（默认：后台读缓存续命，不进对话）| prompt（发一条 poke 消息，会留在对话里）` }
         }
-        pokeMode = v
-        await setPref($, 'mode', v)
-        return { text: v === 'fork' ? '保活方式：fork，后台读缓存续命，对话里没有 poke 消息；fork 失败时自动改发 poke。' : '保活方式：prompt，每次发一条 poke 消息。' }
+        const scope = await setPref($, c, 'mode', v, isHere)
+        return { text: v === 'fork' ? `保活方式：fork${scope}，后台读缓存续命，对话里没有 poke 消息；fork 失败时自动改发 poke。` : `保活方式：prompt${scope}，每次发一条 poke 消息。` }
       }
       case 'notify': {
         const v = value.toLowerCase()
@@ -1587,18 +1705,14 @@ export const register: Register = (on, options) => {
         return { text: costLines(c).join('\n') }
       case 'every': {
         if (!value || value === 'auto') {
-          c.every = null
-          await setPref($, 'every', 0)
-          await refresh($, c)
-          return { text: `Poking ${span(everyOf(c))} after the last request (auto, ${ttlLabel(ttlOf(c))} cache).` }
+          const scope = await setPref($, c, 'every', 0, isHere)
+          return { text: `Poking ${span(everyOf(c))} after the last request (auto, ${ttlLabel(ttlOf(c))} cache)${scope}.` }
         }
         const ms = parseDuration(value)
         if (ms === null || ms < 30_000) return { text: `Not a duration I know (30s or more): ${value}.` }
         if (ms >= ttlOf(c)) return { text: `${span(ms)} is past the ${ttlLabel(ttlOf(c))} cache: it would be cold by then.` }
-        c.every = ms
-        await setPref($, 'every', ms / MINUTE)
-        await refresh($, c)
-        return { text: `Poking ${span(ms)} after the last request.` }
+        const scope = await setPref($, c, 'every', ms / MINUTE, isHere)
+        return { text: `Poking ${span(ms)} after the last request${scope}.` }
       }
       case 'ttl': {
         const v = value.toLowerCase()
@@ -1619,9 +1733,8 @@ export const register: Register = (on, options) => {
         const ms = parseDuration(value)
         if (ms === null) return { text: `Not a duration I know: ${value || '(none)'}. Try 8h, or off for no end this time.` }
         if (ms < MINUTE) return { text: 'At least a minute.' }
-        c.idle = ms
-        await setPref($, 'idle', ms / 3_600_000)
-        return { text: `Caffeine turns itself off after ${span(ms)} without a turn of your own.` }
+        const scope = await setPref($, c, 'idle', ms / 3_600_000, isHere)
+        return { text: `Caffeine turns itself off after ${span(ms)} without a turn of your own${scope}.` }
       }
       case 'band': {
         const v = value.toLowerCase()
@@ -1644,6 +1757,9 @@ export const register: Register = (on, options) => {
           `${c.isForever ? 'No idle stop this time: on until you turn it off' : `Off by itself after ${span(c.idle)} idle`} · auto ${c.autoAt ? `past ${sized(c.autoAt)}` : 'off'} · band ${c.band}`,
           `自动压缩 ${c.compactOn ? '开' : '关'} · 大小线 ${sized(c.size)}（现在 ${sized(c.context)}）· 已压缩 ${c.compacts} 次${c.isOn ? '' : standby(c, now)}`,
           `限额前提前压缩：用量到 ${c.wallPercent}% 且上下文到 ${sized(c.wallSize)} 以上`,
+          Object.keys(c.local).length
+            ? `这个对话单独设置：${localText(c)}（其余跟随全局；/caffeine size global 这样改回）`
+            : '设置都跟随全局（命令末尾加 here 只改这个对话）',
           c.lastWarm === null ? '' : `The last poke found the cache ${c.lastWarm ? 'warm' : 'cold'}.`,
           c.coldAt ? `The cache last went cold before ${clock(c.coldAt, now)}, after ${span(c.coldGap)} idle.` : '',
           `The poke says: ${c.message}`,

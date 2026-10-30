@@ -52,6 +52,16 @@
 
 超出范围的值按默认值算。0.1.10 及以前用命令改过的设置，升级后会自动搬进配置菜单。
 
+**全局设置和对话设置**：配置菜单和命令改的都是全局设置，所有对话（包括已经开着的）半分钟内跟着变。想让某个对话不一样，在命令末尾加 `here`，只改这个对话，优先于全局：
+
+```
+/caffeine size 300k here      这个对话的大小线单独设成 300k
+/caffeine compact off here    这个对话只保活、不自动压缩
+/caffeine size global         这个对话改回跟随全局
+```
+
+能单独设的有 `compact`、`size`、`limitsize`、`idle`、`every`、`mode`；状态栏、提示弹窗和三个阈值只有全局。`/caffeine status` 会列出这个对话单独设过的项。
+
 ### 状态栏（输入框上方那一行）
 
 `/caffeine band auto|on|off`，也可以在 `/plugin` 的配置菜单里改默认值：

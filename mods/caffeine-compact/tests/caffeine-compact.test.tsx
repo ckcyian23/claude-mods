@@ -1143,7 +1143,8 @@ test('the log keeps lines other sessions wrote after this one started', async ($
   mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
   world(on, [])
   await $.session.start({ cwd: 'D:\\work', surface: 'terminal', isInteractive: true })
-  // another session appends while this one runs
+  // what this one logged at start has landed; then another session appends while this one runs
+  await run($, 'log')
   kept.set('log', ['10-27 09:00:00 another session', '10-27 09:01:00 another session again'])
   await measure($, 250_000)
   await turn($, 't1', 'work')
@@ -1204,6 +1205,76 @@ test('automatic compaction off leaves keep-alive alone: no compaction of either 
   await time.advance(60 * MIN)
   expect(compactions).toEqual([])
   forkUsage = null
+})
+
+test('`here` sets a setting for this conversation alone; `global` gives it back to the global one', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  mock.store(on)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  compactions.length = 0
+  const sets: string[] = []
+  on('config.set', ($, e) => {
+    sets.push(`${e.key}=${String(e.value)}`)
+    return { value: e.value } as never
+  })
+  world(on, [])
+  await start($)
+  expect((await run($, 'status')).text).toContain('设置都跟随全局')
+
+  expect((await run($, 'size 300k here')).text).toContain('只对这个对话生效')
+  expect(sets).toEqual([])
+  expect((await run($, 'status')).text).toContain('这个对话单独设置：size 300k')
+  await measure($, 250_000)
+  await turn($, 't1', 'work')
+  await time.advance(56 * MIN)
+  expect(compactions).toEqual([])
+
+  // a global change says this conversation keeps its own value
+  expect((await run($, 'size 150k')).text).toContain('仍按本对话的算')
+  expect(sets).toEqual(['caffeine-compact.size=150'])
+  expect((await run($, 'status')).text).toContain('大小线 300k')
+
+  expect((await run($, 'size global')).text).toContain('改回跟随全局')
+  expect((await run($, 'status')).text).toContain('大小线 150k')
+  await turn($, 't2', 'work')
+  await time.advance(56 * MIN)
+  expect(compactions).toEqual(['plugin'])
+})
+
+test('a global setting changed in another session reaches this one within half a minute', async ($, on) => {
+  const time = mock.clock(on, { now: at(9, 0) })
+  const kept = new Map<string, unknown>()
+  on('store.get', ($, e) => ({ value: kept.get(e.key) }) as never)
+  on('store.set', ($, e) => {
+    kept.set(e.key, e.value)
+    return { value: undefined } as never
+  })
+  on('store.delete', ($, e) => {
+    kept.delete(e.key)
+    return { value: undefined } as never
+  })
+  on('store.keys', () => ({ value: [...kept.keys()] }) as never)
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  world(on, [])
+  await start($)
+  expect((await run($, 'status')).text).toContain('大小线 200k')
+  kept.set('prefs', { values: { size: 300, compact: false }, t: at(9, 0) })
+  await time.advance(31_000)
+  const status = (await run($, 'status')).text
+  expect(status).toContain('自动压缩 关')
+  expect(status).toContain('大小线 300k')
+})
+
+test('a change in the config menu is global: the store carries it over what the store had', async ($, on) => {
+  mock.clock(on, { now: at(9, 0) })
+  mock.store(on, { prefs: { values: { size: 220 }, t: at(8, 0) } })
+  mock.env(on, { ENABLE_PROMPT_CACHING_1H: '1' })
+  on('config.set', ($, e) => ({ value: e.value }) as never)
+  world(on, [])
+  await start($)
+  expect((await run($, 'status')).text).toContain('大小线 220k')
+  await $.config.set({ key: 'caffeine-compact.size', value: 300 })
+  expect((await run($, 'status')).text).toContain('大小线 300k')
 })
 
 test('settings older versions kept in the store move to the config menu once', async ($, on) => {
